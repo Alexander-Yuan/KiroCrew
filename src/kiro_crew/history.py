@@ -3132,6 +3132,31 @@ class ConversationLog:
         if "tab_id" in fields:
             self.invalidate_tab_id_cache()
 
+    def update_metadata_if(
+        self, key: str, fields: dict, guard: Callable[[dict], bool]
+    ) -> bool:
+        """Merge *fields* only if *guard* still accepts the on-disk metadata.
+
+        ``guard`` is evaluated INSIDE the cross-process lock, against the record
+        as it stands at write time. That is the difference from
+        :meth:`update_metadata`: a caller that decided to write based on a
+        snapshot taken earlier cannot land that write over a change another
+        writer made in the meantime, because the decision is re-made here rather
+        than trusted from before the lock was acquired. Taking the lock can
+        itself mean waiting, so "checked, then wrote" is not the same as "checked
+        at the moment of writing".
+
+        Returns whether the merge was applied, so a caller can tell a skipped
+        write from a completed one and avoid applying it in memory.
+        """
+        with self._locked(key):
+            if not guard(self._read_metadata(key)):
+                return False
+            self._update_metadata_locked(key, fields)
+        if "tab_id" in fields:
+            self.invalidate_tab_id_cache()
+        return True
+
     def _update_metadata_locked(self, key: str, fields: dict) -> None:
         """Merge *fields* into the session's metadata line and persist.
 
