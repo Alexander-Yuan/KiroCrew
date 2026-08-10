@@ -972,7 +972,9 @@ def test_get_rss_tree_mb_real_process():
     if self_rss is None:
         pytest.skip("RSS introspection unavailable in this environment")
     tree = _get_rss_tree_mb(os.getpid())
-    assert tree is not None and tree >= self_rss  # tree includes self (+ children)
+    # tree includes self (+ children); allow small downward jitter between the
+    # two measurements due to GC / page reclaim.
+    assert tree is not None and tree >= self_rss - 2.0
     assert _get_rss_tree_mb(2**31 - 1) is None
 
 
