@@ -573,6 +573,54 @@ def _collect_whisper_output(
     return txt_files[0].read_text().strip() or None
 
 
+#: Intra-op thread ceiling for the Whisper subprocess. Whisper decoding is
+#: autoregressive: one small matmul per output step, run sequentially. Fanning
+#: each of those out to every core makes the OpenMP barrier cost dominate the
+#: arithmetic, so wall time RISES with core count past a low plateau. Measured
+#: on a 32-vCPU Graviton3 host, openai-whisper ``base``, an 11s clip: 1 thread
+#: 2.5s, 4 threads 1.1s, 8 threads 0.86s, 16 threads 0.88s, 32 threads 14.7s —
+#: a 17x regression from using all the cores. 8 sits on the plateau and is the
+#: last value measured before the collapse. Not a tuning knob: the operator can
+#: still set the thread vars themselves (see :func:`_thread_capped_env`), and
+#: hosts with fewer cores keep all of them.
+_WHISPER_THREAD_CAP = 8
+
+#: Vars that bound the subprocess's intra-op parallelism. ``OMP_NUM_THREADS``
+#: governs torch's own thread pool plus any OpenMP-threaded BLAS (and MKL, which
+#: falls back to it). A pthread-built OpenBLAS — what the aarch64 torch wheels
+#: link — reads ``OPENBLAS_NUM_THREADS`` instead and ignores the OpenMP one, so
+#: both are required to cover the wheel matrix rather than just the common case.
+_THREAD_ENV_VARS = ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS")
+
+
+def _thread_capped_env() -> dict[str, str]:
+    """Return the subprocess environment with intra-op threads bounded.
+
+    Also strips ``PYTHONPATH``/``PYTHONHOME``: the Whisper CLIs are installed
+    out-of-band and run under their own interpreter, so KiroCrew's bundled
+    packages (numpy, torch) must not leak into their runtime.
+
+    An operator who has set ANY of :data:`_THREAD_ENV_VARS` is left completely
+    alone — all of them, not just the one they set. Someone who pins
+    ``OPENBLAS_NUM_THREADS=32`` for a reason has expressed an intent about this
+    process's threading, and silently capping the sibling var would half-honour
+    it in a way that is worse than either choice. That deliberately gives up the
+    speedup for those hosts in exchange for never overriding an explicit
+    setting.
+    """
+    env = os.environ.copy()
+    env.pop("PYTHONPATH", None)
+    env.pop("PYTHONHOME", None)
+    if any(env.get(var) for var in _THREAD_ENV_VARS):
+        return env
+    # os.cpu_count() returns None on platforms that cannot report it; a host
+    # that small (or unknowable) has nothing to cap, so fall through to 1.
+    threads = min(_WHISPER_THREAD_CAP, os.cpu_count() or 1)
+    for var in _THREAD_ENV_VARS:
+        env[var] = str(threads)
+    return env
+
+
 async def _run_whisper_cli(
     binary: str,
     build_args,  # Callable[[str], list[str]]: out_dir -> CLI args (excluding binary)
@@ -582,19 +630,16 @@ async def _run_whisper_cli(
     """Run a Whisper-style CLI in an isolated subprocess and read its transcript.
 
     Shared by ``_transcribe_native`` (openai-whisper) and ``_transcribe_mlx``
-    (mlx_whisper). Both CLIs are installed out-of-band and run under their own
-    Python interpreter, so we strip ``PYTHONPATH``/``PYTHONHOME`` to stop
-    KiroCrew's bundled packages (numpy, torch) from leaking into their runtime.
-    Each writes a ``.txt`` transcript into a temp ``out_dir`` we own and clean
-    up. ``build_args`` lets callers express their differing flags (the two CLIs
-    use hyphenated vs underscored option names).
+    (mlx_whisper). The environment comes from :func:`_thread_capped_env`, which
+    isolates the CLI from KiroCrew's own Python packages and bounds its intra-op
+    parallelism. Each writes a ``.txt`` transcript into a temp ``out_dir`` we own
+    and clean up. ``build_args`` lets callers express their differing flags (the
+    two CLIs use hyphenated vs underscored option names).
     """
     out_dir = await asyncio.to_thread(tempfile.mkdtemp)
     proc = None
     try:
-        clean_env = os.environ.copy()
-        clean_env.pop("PYTHONPATH", None)
-        clean_env.pop("PYTHONHOME", None)
+        clean_env = _thread_capped_env()
         proc = await asyncio.create_subprocess_exec(
             binary,
             *build_args(out_dir),

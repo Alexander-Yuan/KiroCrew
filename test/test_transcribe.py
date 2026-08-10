@@ -13,11 +13,14 @@ import pytest
 from kiro_crew import platform_compat as _pc
 from kiro_crew.config.loader import SttConfig
 from kiro_crew.transcribe import (
+    _THREAD_ENV_VARS,
+    _WHISPER_THREAD_CAP,
     BREW_PATH_DIRS,
     _find_mlx_whisper,
     _find_whisper,
     _is_openai_whisper,
     _ProfileCredentialResolver,
+    _thread_capped_env,
     find_brew,
     is_available,
     transcribe_audio,
@@ -232,6 +235,114 @@ class TestNativeFp16Gating:
         assert "--fp16" not in args
         # The rest of the invocation is unchanged — the engine still gets its model/output flags.
         assert "--model" in args and "--output_format" in args
+
+
+# ---------------------------------------------------------------------------
+# _thread_capped_env
+# ---------------------------------------------------------------------------
+
+
+class TestWhisperThreadCap:
+    """The Whisper subprocess must not fan its tiny matmuls out to every core.
+
+    Whisper decodes autoregressively, so a many-core host pays OpenMP barrier
+    cost per output step and gets SLOWER as cores are added: 32 threads measured
+    14.7s against 0.86s at 8 on the same 11s clip. These tests pin the cap, the
+    small-host behaviour, and the operator-override escape hatch.
+    """
+
+    def _env(self, monkeypatch, *, cpus, preset: dict[str, str] | None = None) -> dict[str, str]:
+        for var in _THREAD_ENV_VARS:
+            monkeypatch.delenv(var, raising=False)
+        for key, value in (preset or {}).items():
+            monkeypatch.setenv(key, value)
+        monkeypatch.setattr("kiro_crew.transcribe.os.cpu_count", lambda: cpus)
+        return _thread_capped_env()
+
+    def test_many_core_host_is_capped(self, monkeypatch):
+        env = self._env(monkeypatch, cpus=32)
+        assert [env[var] for var in _THREAD_ENV_VARS] == [str(_WHISPER_THREAD_CAP)] * len(
+            _THREAD_ENV_VARS
+        )
+
+    def test_small_host_keeps_all_its_cores(self, monkeypatch):
+        # Capping to 8 on a 4-core box would throw away half the machine.
+        env = self._env(monkeypatch, cpus=4)
+        assert all(env[var] == "4" for var in _THREAD_ENV_VARS)
+
+    def test_unknowable_cpu_count_falls_back_to_one(self, monkeypatch):
+        # os.cpu_count() returns None on platforms that cannot report it.
+        env = self._env(monkeypatch, cpus=None)
+        assert all(env[var] == "1" for var in _THREAD_ENV_VARS)
+
+    def test_operator_setting_is_never_overridden(self, monkeypatch):
+        env = self._env(monkeypatch, cpus=32, preset={"OMP_NUM_THREADS": "32"})
+        assert env["OMP_NUM_THREADS"] == "32"
+
+    def test_sibling_var_is_left_alone_when_operator_set_either_one(self, monkeypatch):
+        """Pinning one var must not get half-honoured by capping the other.
+
+        A host that sets only OPENBLAS_NUM_THREADS has still expressed intent
+        about this process's threading, so we inject NEITHER var rather than
+        producing a mixed configuration the operator never asked for.
+        """
+        env = self._env(monkeypatch, cpus=32, preset={"OPENBLAS_NUM_THREADS": "32"})
+        assert env["OPENBLAS_NUM_THREADS"] == "32"
+        assert "OMP_NUM_THREADS" not in env
+
+    def test_empty_value_counts_as_unset(self, monkeypatch):
+        # An exported-but-empty var configures nothing, so it must not be read
+        # as an operator override that suppresses the cap.
+        env = self._env(monkeypatch, cpus=32, preset={"OMP_NUM_THREADS": ""})
+        assert all(env[var] == str(_WHISPER_THREAD_CAP) for var in _THREAD_ENV_VARS)
+
+    def test_bundled_python_env_is_still_stripped(self, monkeypatch):
+        # Pre-existing contract: the out-of-band CLI runs under its own
+        # interpreter and must not import KiroCrew's numpy/torch.
+        env = self._env(
+            monkeypatch,
+            cpus=32,
+            preset={"PYTHONPATH": "/opt/kirocrew/lib", "PYTHONHOME": "/opt/kirocrew"},
+        )
+        assert "PYTHONPATH" not in env
+        assert "PYTHONHOME" not in env
+
+    def test_unrelated_environment_survives(self, monkeypatch):
+        # ffmpeg is found via PATH, so the env must be a copy, not a clean slate.
+        env = self._env(monkeypatch, cpus=32, preset={"PATH": "/custom/bin"})
+        assert env["PATH"] == "/custom/bin"
+
+    @pytest.mark.asyncio
+    async def test_cap_reaches_the_real_subprocess(self, tmp_path, monkeypatch):
+        """Wiring test: the helper is useless if _run_whisper_cli ignores it."""
+        for var in _THREAD_ENV_VARS:
+            monkeypatch.delenv(var, raising=False)
+        monkeypatch.setattr("kiro_crew.transcribe.os.cpu_count", lambda: 32)
+
+        audio = tmp_path / "test.webm"
+        audio.write_text("fake audio")
+        cfg = SttConfig(enabled=True, provider="whisper", timeout_secs=10)
+
+        mock_proc = AsyncMock()
+        mock_proc.returncode = 0
+        mock_proc.communicate = AsyncMock(return_value=(b"", b""))
+        captured: dict = {}
+
+        async def fake_exec(*args, **kwargs):
+            captured["env"] = kwargs["env"]
+            out_dir = args[args.index("--output_dir") + 1]
+            Path(out_dir).joinpath("test.txt").write_text("hello world")
+            return mock_proc
+
+        with patch("kiro_crew.transcribe._find_whisper", return_value="/usr/bin/whisper"):
+            with patch(
+                "kiro_crew.transcribe.asyncio.create_subprocess_exec", side_effect=fake_exec
+            ):
+                assert await transcribe_audio(str(audio), cfg) == "hello world"
+
+        assert all(
+            captured["env"][var] == str(_WHISPER_THREAD_CAP) for var in _THREAD_ENV_VARS
+        ), captured["env"]
 
 
 # ---------------------------------------------------------------------------

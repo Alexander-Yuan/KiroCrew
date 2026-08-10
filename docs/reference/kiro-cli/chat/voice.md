@@ -91,6 +91,19 @@ status badge stays "not installed".
 dependency because the `mlx` wheel is arm64-only; Kiro Crew invokes the
 `mlx_whisper` CLI as a subprocess, exactly like the `whisper` provider.
 
+### CPU threads (many-core hosts)
+
+Whisper decodes one output step at a time, and each step is a small matmul. On a
+host with many cores, spreading each of those over every core makes thread
+synchronisation cost more than the arithmetic, so transcription gets *slower* as
+cores are added — measured on a 32-vCPU Graviton3 host with the `base` model and
+an 11-second clip, 32 threads took 14.7s against 0.86s at 8 threads.
+
+Kiro Crew therefore caps the Whisper subprocess at 8 intra-op threads
+(`OMP_NUM_THREADS` / `OPENBLAS_NUM_THREADS`), or the host's core count if that is
+lower. Hosts with 8 or fewer cores are unaffected. If you set either variable
+yourself, Kiro Crew leaves both alone and your value is used as-is.
+
 ## Voice Output (Text-to-Speech)
 
 Kiro Crew can speak responses aloud using Amazon Polly. Two modes are available:
