@@ -7638,7 +7638,10 @@
       "untagged_2": "Ohne Tag",
       "will_be_moved_to_older_sessions": "werden zu älteren Sitzungen verschoben.",
       "within": "Innerhalb von",
-      "yesterday": "Gestern"
+      "yesterday": "Gestern",
+      "new_crew_chat": "Neuer Crew-Mode-Chat",
+      "crew_mode": "Crew Mode — Themen laufen parallel in Untersitzungen",
+      "crew": "Crew"
     },
     "connectionsPage": {
       "access": "Zugriff",

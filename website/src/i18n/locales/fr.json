@@ -7743,7 +7743,10 @@
       "untagged_2": "Non étiquetés",
       "will_be_moved_to_older_sessions": "seront déplacées vers les anciennes sessions.",
       "within": "Dans",
-      "yesterday": "Hier"
+      "yesterday": "Hier",
+      "new_crew_chat": "Nouveau chat Crew Mode",
+      "crew_mode": "Crew Mode — les sujets avancent en sous-sessions parallèles",
+      "crew": "Crew"
     },
     "connectionsPage": {
       "access": "Accès",

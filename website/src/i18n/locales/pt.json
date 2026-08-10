@@ -7743,7 +7743,10 @@
       "untagged_2": "Não etiquetados",
       "will_be_moved_to_older_sessions": "será movida para sessões antigas.",
       "within": "Dentro de",
-      "yesterday": "Ontem"
+      "yesterday": "Ontem",
+      "new_crew_chat": "Novo chat Crew Mode",
+      "crew_mode": "Crew Mode — os tópicos avançam em subsessões paralelas",
+      "crew": "Crew"
     },
     "connectionsPage": {
       "access": "Acesso",

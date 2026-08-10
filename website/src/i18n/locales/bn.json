@@ -7638,7 +7638,10 @@
       "untagged_2": "ট্যাগবিহীন",
       "will_be_moved_to_older_sessions": "পুরোনো সেশনে সরিয়ে নেওয়া হবে।",
       "within": "গত",
-      "yesterday": "গতকাল"
+      "yesterday": "গতকাল",
+      "new_crew_chat": "নতুন Crew Mode চ্যাট",
+      "crew_mode": "Crew Mode — বিষয়গুলি সমান্তরাল উপ-সেশনে চলে",
+      "crew": "Crew"
     },
     "connectionsPage": {
       "access": "অ্যাক্সেস",
