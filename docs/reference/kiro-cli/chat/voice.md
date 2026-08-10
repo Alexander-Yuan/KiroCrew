@@ -93,16 +93,25 @@ dependency because the `mlx` wheel is arm64-only; Kiro Crew invokes the
 
 ### CPU threads (many-core hosts)
 
-Whisper decodes one output step at a time, and each step is a small matmul. On a
-host with many cores, spreading each of those over every core makes thread
-synchronisation cost more than the arithmetic, so transcription gets *slower* as
-cores are added — measured on a 32-vCPU Graviton3 host with the `base` model and
-an 11-second clip, 32 threads took 14.7s against 0.86s at 8 threads.
+Whisper decodes one output step at a time, and each step is a small matmul that
+ends in a thread barrier. Wide thread pools therefore cost latency per step
+instead of buying throughput, and on a host that is doing other work — a Kiro
+Crew host runs the gateway and agent sessions alongside — the workers get
+time-sliced, so each barrier waits on threads the scheduler has not run yet.
 
-Kiro Crew therefore caps the Whisper subprocess at 8 intra-op threads
-(`OMP_NUM_THREADS` / `OPENBLAS_NUM_THREADS`), or the host's core count if that is
-lower. Hosts with 8 or fewer cores are unaffected. If you set either variable
-yourself, Kiro Crew leaves both alone and your value is used as-is.
+Kiro Crew derives the Whisper subprocess's thread count from the host: **half the
+available cores**, capped at 16. Measured on a 32-vCPU Graviton3 host with an
+11-second clip, 16 threads beat 31 (`base` 4.9s vs 7.3s, `turbo` 20.8s vs 26.9s),
+and restricted to 16 cores with `taskset`, 8 threads beat 16 (5s vs 7s).
+
+The headroom buys predictability more than raw speed: 8 threads measured
+4.9–5.0s across repeats, while taking all 32 ranged 8.1–68.4s depending on how
+busy the machine was.
+
+The count comes from `sched_getaffinity` where available, so a CPU-restricted
+container gets its real budget rather than the whole machine's. If you set
+`OMP_NUM_THREADS` or `OPENBLAS_NUM_THREADS` yourself, Kiro Crew leaves both alone
+and your value is used as-is.
 
 ## Voice Output (Text-to-Speech)
 

@@ -14,7 +14,7 @@ from kiro_crew import platform_compat as _pc
 from kiro_crew.config.loader import SttConfig
 from kiro_crew.transcribe import (
     _THREAD_ENV_VARS,
-    _WHISPER_THREAD_CAP,
+    _WHISPER_THREAD_CEILING,
     BREW_PATH_DIRS,
     _find_mlx_whisper,
     _find_whisper,
@@ -245,34 +245,72 @@ class TestNativeFp16Gating:
 class TestWhisperThreadCap:
     """The Whisper subprocess must not fan its tiny matmuls out to every core.
 
-    Whisper decodes autoregressively, so a many-core host pays OpenMP barrier
-    cost per output step and gets SLOWER as cores are added: 32 threads measured
-    14.7s against 0.86s at 8 on the same 11s clip. These tests pin the cap, the
-    small-host behaviour, and the operator-override escape hatch.
+    Whisper decodes autoregressively, so a wide pool pays a barrier per output
+    step and gets SLOWER: at 32 visible cores 16 threads beat 31 (base 4.9s vs
+    7.3s), and taking all 32 ranged 8.1-68.4s against a steady 4.9s. The count is
+    derived from the host — half the available cores — so these tests pin the
+    derivation, its bounds, and the operator-override escape hatch.
     """
 
-    def _env(self, monkeypatch, *, cpus, preset: dict[str, str] | None = None) -> dict[str, str]:
+    def _env(
+        self,
+        monkeypatch,
+        *,
+        cpus,
+        affinity: set[int] | None = None,
+        preset: dict[str, str] | None = None,
+    ) -> dict[str, str]:
         for var in _THREAD_ENV_VARS:
             monkeypatch.delenv(var, raising=False)
         for key, value in (preset or {}).items():
             monkeypatch.setenv(key, value)
         monkeypatch.setattr("kiro_crew.transcribe.os.cpu_count", lambda: cpus)
+        if affinity is None:
+            monkeypatch.delattr("kiro_crew.transcribe.os.sched_getaffinity", raising=False)
+        else:
+            monkeypatch.setattr(
+                "kiro_crew.transcribe.os.sched_getaffinity", lambda _pid: affinity
+            )
         return _thread_capped_env()
 
-    def test_many_core_host_is_capped(self, monkeypatch):
-        env = self._env(monkeypatch, cpus=32)
-        assert [env[var] for var in _THREAD_ENV_VARS] == [str(_WHISPER_THREAD_CAP)] * len(
-            _THREAD_ENV_VARS
-        )
+    @pytest.mark.parametrize(
+        "cpus,expected",
+        [
+            (32, 16),  # measured host: 16 beat both 8 and 31
+            (16, 8),  # measured under taskset: 8 beat 16
+            (8, 4),
+            (4, 2),
+            (2, 1),
+            (1, 1),  # never 0 — a 0 would let the runtime pick all cores again
+        ],
+    )
+    def test_half_the_cores(self, monkeypatch, cpus, expected):
+        env = self._env(monkeypatch, cpus=cpus)
+        assert all(env[var] == str(expected) for var in _THREAD_ENV_VARS)
 
-    def test_small_host_keeps_all_its_cores(self, monkeypatch):
-        # Capping to 8 on a 4-core box would throw away half the machine.
-        env = self._env(monkeypatch, cpus=4)
-        assert all(env[var] == "4" for var in _THREAD_ENV_VARS)
+    def test_huge_host_stops_at_the_ceiling(self, monkeypatch):
+        # Half of 128 would be 64 — wider than anything measured, and decode-heavy
+        # models already stop gaining above 8.
+        env = self._env(monkeypatch, cpus=128)
+        assert all(env[var] == str(_WHISPER_THREAD_CEILING) for var in _THREAD_ENV_VARS)
+
+    def test_affinity_beats_cpu_count(self, monkeypatch):
+        """A cgroup/taskset restriction is the case that over-threads worst.
+
+        os.cpu_count() reports the whole machine there, so deriving from it would
+        hand a 4-CPU container the thread budget of a 32-core host.
+        """
+        env = self._env(monkeypatch, cpus=32, affinity={0, 1, 2, 3})
+        assert all(env[var] == "2" for var in _THREAD_ENV_VARS)
+
+    def test_falls_back_to_cpu_count_without_affinity_support(self, monkeypatch):
+        # macOS and Windows have no sched_getaffinity.
+        env = self._env(monkeypatch, cpus=32, affinity=None)
+        assert all(env[var] == "16" for var in _THREAD_ENV_VARS)
 
     def test_unknowable_cpu_count_falls_back_to_one(self, monkeypatch):
         # os.cpu_count() returns None on platforms that cannot report it.
-        env = self._env(monkeypatch, cpus=None)
+        env = self._env(monkeypatch, cpus=None, affinity=None)
         assert all(env[var] == "1" for var in _THREAD_ENV_VARS)
 
     def test_operator_setting_is_never_overridden(self, monkeypatch):
@@ -292,9 +330,18 @@ class TestWhisperThreadCap:
 
     def test_empty_value_counts_as_unset(self, monkeypatch):
         # An exported-but-empty var configures nothing, so it must not be read
-        # as an operator override that suppresses the cap.
+        # as an operator override that suppresses the derivation.
         env = self._env(monkeypatch, cpus=32, preset={"OMP_NUM_THREADS": ""})
-        assert all(env[var] == str(_WHISPER_THREAD_CAP) for var in _THREAD_ENV_VARS)
+        assert all(env[var] == "16" for var in _THREAD_ENV_VARS)
+
+    def test_both_pools_get_the_same_count(self, monkeypatch):
+        """torch and OpenBLAS keep separate pools; width is what costs, not total.
+
+        omp=31/blas=1 measured 30-50% worse than omp=16/blas=16 at the same 32
+        total threads, so the budget is applied per pool rather than split.
+        """
+        env = self._env(monkeypatch, cpus=32)
+        assert env["OMP_NUM_THREADS"] == env["OPENBLAS_NUM_THREADS"]
 
     def test_bundled_python_env_is_still_stripped(self, monkeypatch):
         # Pre-existing contract: the out-of-band CLI runs under its own
@@ -317,7 +364,7 @@ class TestWhisperThreadCap:
         """Wiring test: the helper is useless if _run_whisper_cli ignores it."""
         for var in _THREAD_ENV_VARS:
             monkeypatch.delenv(var, raising=False)
-        monkeypatch.setattr("kiro_crew.transcribe.os.cpu_count", lambda: 32)
+        monkeypatch.setattr("kiro_crew.transcribe._whisper_thread_count", lambda: 16)
 
         audio = tmp_path / "test.webm"
         audio.write_text("fake audio")
@@ -340,9 +387,7 @@ class TestWhisperThreadCap:
             ):
                 assert await transcribe_audio(str(audio), cfg) == "hello world"
 
-        assert all(
-            captured["env"][var] == str(_WHISPER_THREAD_CAP) for var in _THREAD_ENV_VARS
-        ), captured["env"]
+        assert all(captured["env"][var] == "16" for var in _THREAD_ENV_VARS), captured["env"]
 
 
 # ---------------------------------------------------------------------------
