@@ -456,7 +456,10 @@ class HookManager:
         enforce the path/host scopes a display title cannot carry
         (``filesystem.write``, ``network.egress``).  Both default to empty, so a
         caller that does not thread them only loses those two arg-derived scopes,
-        never the title-derived ones.
+        never the title-derived ones.  ``raw_params`` additionally feeds the deny
+        tiers a synthesized ``file-search …`` target (``_search_deny_target``) for a
+        search-shaped call, whose walked root and depth cap exist ONLY in its
+        arguments; a caller that omits ``raw_params`` loses that coverage too.
 
         ``is_shell`` enforces deny-by-default for shell tools: when a caller
         reports a shell tool (``is_shell=True``) but cannot supply the raw
@@ -593,6 +596,12 @@ class HookManager:
         deny_targets = [normalized, tool_name]
         if command:
             deny_targets.append(command)
+        # A file-search builtin's scope lives only in its arguments — it carries no
+        # ``command``, and its title need not name the root it walks — so this target is
+        # the only form in which a deny rule can see a whole-tree walk.
+        search_target = _search_deny_target(raw_params)
+        if search_target:
+            deny_targets.append(search_target)
         for target in deny_targets:
             reason = authority.is_denied(
                 target,
@@ -1254,6 +1263,117 @@ _TOOL_TITLE_PREFIXES = ("Running: ", "Reading ")
 # ``filesystem.write`` scope. Used to gate the write-only config-file protection
 # so reads are not affected.
 _EDIT_TOOL_KIND = "edit"
+
+# Fixed prefix of the synthesized file-search deny target. A NAMESPACE, not a trust
+# boundary: it exists so a rule can address a search's SCOPE distinctly from a command
+# line. The display title is a deny target in its own right, so a title quoting this
+# prefix trips such a rule too — an over-block, identical to the title tier for every
+# other rule, and it grants nothing.
+_SEARCH_DENY_PREFIX = "file-search"
+
+# ``operation`` values that walk a tree WITHOUT carrying a ``pattern``. Enumerated by
+# name, so a tool with a novel recursive argument shape is not recognized — see the
+# residual limits in ``_search_deny_target``.
+_RECURSIVE_SEARCH_OPERATIONS: frozenset[str] = frozenset(
+    {
+        "search_symbols",
+        "search_codebase_map",
+        "generate_codebase_overview",
+        "find_references",
+    }
+)
+
+# The SCOPE-bearing arguments of a file search as ``(canonical, accepted spellings)``,
+# in a fixed order so the synthesized target is deterministic. Scope is the root walked
+# and the depth cap — NOT what is being looked for. ``pattern`` and ``include`` are
+# model-authored free text and are deliberately NOT emitted: a value can mint a field
+# it is not (a pattern containing ``max_depth=`` silences a rule keyed on the absence
+# of a cap), and a benign search whose pattern is ``DROP TABLE`` would match a
+# command-oriented built-in rule. ``pattern`` is read by the shape gate only.
+#
+# Each key is read under every spelling kiro-cli may echo — our schemas declare
+# snake_case but some calls come back in ``rawInput`` camelCased (the same split
+# ``TOOL_PURPOSE_KEYS`` handles) — and emitted under the canonical name, so a rule
+# spells each field once. A missed spelling INVERTS a rule rather than weakening it:
+# with no ``max_depth`` field, a rule keyed on the absence of a cap fires on a search
+# that carries one.
+_SEARCH_DENY_ARG_KEYS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("path", ("path", "file_path", "filePath")),
+    ("max_depth", ("max_depth", "maxDepth")),
+)
+
+# What a value must not contribute to the flat ``key=value …`` grammar: ``=`` mints a
+# field name and whitespace mints a field boundary, so a value carrying either could
+# forge a field the call does not have. ``%`` is escaped first so the encoding is
+# unambiguous. It is lossy by design — every whitespace character collapses to ``%20``
+# — because a rule matches a shape and never needs the original bytes back.
+_SEARCH_DENY_ESCAPES: tuple[tuple[str, str], ...] = (("%", "%25"), ("=", "%3D"))
+
+
+def _encode_search_field(value: str) -> str:
+    """Percent-encode the characters a value could use to forge a field."""
+    for raw, encoded in _SEARCH_DENY_ESCAPES:
+        value = value.replace(raw, encoded)
+    return "".join("%20" if ch.isspace() else ch for ch in value)
+
+
+def _is_search_shaped(raw_params: Mapping) -> bool:
+    """Whether these arguments describe a recursive search.
+
+    A non-empty ``pattern`` string, or an ``operation`` naming a recursive walk that
+    carries no pattern of its own.
+    """
+    pattern = raw_params.get("pattern")
+    if isinstance(pattern, str) and pattern:
+        return True
+    operation = raw_params.get("operation")
+    return isinstance(operation, str) and operation in _RECURSIVE_SEARCH_OPERATIONS
+
+
+def _search_deny_target(raw_params: dict | None) -> str:
+    """Synthesize a deny-matcher target from a file-search call's scope arguments.
+
+    Both deny tiers match TEXT, and they are handed the display title plus — for a
+    shell tool — the raw ``command``. A file-search builtin has neither: its title is
+    LLM-authored prose that need not name a path, and it carries no ``command``, so the
+    root it walks and whether that walk is depth-capped reach no deny rule. This target
+    is what a rule matches instead: ``"<prefix> path=… max_depth=…"`` over the scope
+    arguments present, or ``""`` when the arguments are not search-shaped.
+
+    Identification is by ARGUMENT SHAPE, never the title, for the same reason the
+    sensitive-path keystone reads ``raw_params['path']``: the arguments are what the
+    tool runs with. A ``command`` means a shell tool, already covered by the raw-command
+    target.
+
+    Every emitted value is encoded so it cannot forge a field (``_encode_search_field``);
+    without that, model-authored text disarms the very rule shape this mechanism exists
+    to serve.
+
+    Residual limits, deliberately not closed here — this is a defense-in-depth layer
+    over the always-on sensitive-path keystone, not a complete sandbox:
+      * The recursive-``operation`` set is enumerated, so a tool that walks a tree under
+        some other argument shape produces no target.
+      * Only singular path spellings are read; a call passing a ``paths``/``files``
+        sequence emits no ``path`` field.
+      * What is being searched FOR is never expressible in a rule, only where.
+    """
+    if not isinstance(raw_params, Mapping) or raw_params.get("command"):
+        return ""
+    if not _is_search_shaped(raw_params):
+        return ""
+    fields = [_SEARCH_DENY_PREFIX]
+    for canonical, spellings in _SEARCH_DENY_ARG_KEYS:
+        for key in spellings:
+            value = raw_params.get(key)
+            # ``bool`` is an ``int`` subclass; a boolean depth is meaningless and would
+            # emit a field no rule can match sensibly.
+            if isinstance(value, bool) or not isinstance(value, (str, int)):
+                continue
+            encoded = _encode_search_field(str(value))
+            if encoded:
+                fields.append(f"{canonical}={encoded}")
+                break
+    return " ".join(fields)
 
 
 def _normalize_tool_name(tool_name: str) -> str:

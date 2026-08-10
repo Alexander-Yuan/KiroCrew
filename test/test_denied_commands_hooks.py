@@ -585,3 +585,220 @@ class TestReadOnlyAutoApprove:
         mgr = HookManager(cfg)
         result = mgr.on_tool_call("search logs", command="grep forbidden /var/log", is_shell=True)
         assert result.action == TOOL_DENY
+
+
+class TestSearchArgDenyTarget:
+    """A file-search builtin's scope reaches the deny tiers.
+
+    ``glob``/``grep`` carry no ``command`` and a title that need not name the tree they
+    walk, so this target is the only form in which a rule can tell a scoped search from
+    a whole-home traversal.
+    """
+
+    # Mirrors the shape of the built-in find rules: a home root, and no depth cap.
+    UNCAPPED_HOME_SEARCH = r"file-search (?!.*max_depth=).*path=/local/home/[\w.-]+(?:\s|$)"
+
+    def _mgr(self):
+        cfg = HooksConfig(
+            denied_commands_user_added=[
+                UserDeniedPattern(id="u1", pattern=self.UNCAPPED_HOME_SEARCH)
+            ]
+        )
+        return HookManager(cfg)
+
+    def test_uncapped_home_rooted_search_is_denied(self):
+        result = self._mgr().on_tool_call(
+            "Locate the tracking docs",  # title names neither the root nor the depth
+            tool_kind="read",
+            raw_params={"path": "/local/home/alice", "pattern": "**/notes/*.md"},
+        )
+        assert result.action == TOOL_DENY
+
+    def test_recursive_operation_without_a_pattern_is_denied(self):
+        # A tree walk that carries no `pattern` still has a scope to govern.
+        result = self._mgr().on_tool_call(
+            "Look up the symbol",
+            tool_kind="read",
+            raw_params={"operation": "search_symbols", "path": "/local/home/alice"},
+        )
+        assert result.action == TOOL_DENY
+
+    def test_depth_capped_home_rooted_search_is_allowed(self):
+        # The cap is the whole point: bounding the walk must lift the denial, or the
+        # rule is just a home-directory ban and operators cannot express "unbounded".
+        result = self._mgr().on_tool_call(
+            "Locate the tracking docs",
+            tool_kind="read",
+            raw_params={"path": "/local/home/alice", "pattern": "*.md", "max_depth": 2},
+        )
+        assert result.action != TOOL_DENY
+
+    def test_camelcased_depth_cap_is_honoured_at_the_gate(self):
+        # The end-to-end form of the inversion risk: a capped search must survive the
+        # uncapped-search rule even when kiro-cli spells the key camelCase.
+        result = self._mgr().on_tool_call(
+            "Locate the tracking docs",
+            tool_kind="read",
+            raw_params={"path": "/local/home/alice", "pattern": "*.md", "maxDepth": 2},
+        )
+        assert result.action != TOOL_DENY
+
+    def test_a_pattern_cannot_forge_a_depth_cap(self):
+        # The defect that makes this mechanism worth having: model-authored argument
+        # text must not be able to disarm the rule. An uncapped home walk whose PATTERN
+        # spells the cap stays denied.
+        result = self._mgr().on_tool_call(
+            "Search for the literal",
+            tool_kind="read",
+            raw_params={"path": "/local/home/alice", "pattern": "needle max_depth=1"},
+        )
+        assert result.action == TOOL_DENY
+
+    def test_a_path_cannot_forge_a_depth_cap(self):
+        # Same forgery through the one field that IS emitted. Asserted on the target
+        # rather than the verdict: encoding stops a value minting a `max_depth=` FIELD,
+        # but no encoding can make a rule anchored on `(?:\s|$)` match a path carrying a
+        # suffix — `/local/home/alice/.` evades that anchor too. See the anchoring note
+        # in the security spec.
+        from kiro_crew.hooks import _search_deny_target
+
+        target = _search_deny_target(
+            {"path": "/local/home/alice max_depth=1", "pattern": "*.md"}
+        )
+        assert "max_depth=" not in target
+
+    def test_scoped_search_outside_home_is_allowed(self):
+        result = self._mgr().on_tool_call(
+            "Find the config",
+            tool_kind="read",
+            raw_params={"path": "/srv/app", "pattern": "**/*.json"},
+        )
+        assert result.action != TOOL_DENY
+
+    def test_a_command_shaped_pattern_does_not_trip_command_rules(self):
+        # A read-only search FOR a dangerous string is not a dangerous command. The
+        # pattern is never emitted, so it cannot match a command-oriented built-in.
+        result = HookManager(HooksConfig()).on_tool_call(
+            "Audit the migrations",
+            tool_kind="read",
+            raw_params={"path": "/srv/app", "pattern": "DROP TABLE"},
+        )
+        assert result.action != TOOL_DENY
+
+    def test_benign_title_cannot_hide_a_searchs_arguments(self):
+        # The invariant that matters: identification reads the params, so dressing the
+        # title benignly does not let an uncapped home walk through. (The converse —
+        # a title QUOTING the rule — trips it via the title tier, which over-blocks and
+        # grants nothing; asserted below so the behavior is pinned.)
+        mgr = self._mgr()
+        assert (
+            mgr.on_tool_call(
+                "just a peek",
+                tool_kind="read",
+                raw_params={"path": "/local/home/alice", "pattern": "**/*"},
+            ).action
+            == TOOL_DENY
+        )
+        assert (
+            mgr.on_tool_call("file-search path=/local/home/alice", raw_params=None).action
+            == TOOL_DENY
+        )
+
+
+class TestSearchDenyTargetSynthesis:
+    """``_search_deny_target`` — the shape gate and the field grammar rules rely on."""
+
+    def test_only_scope_fields_are_emitted_in_declared_order(self):
+        from kiro_crew.hooks import _search_deny_target
+
+        target = _search_deny_target(
+            {"pattern": "*.py", "max_depth": 3, "path": "/srv", "include": "*.txt"}
+        )
+        assert target == "file-search path=/srv max_depth=3"
+
+    def test_pattern_and_include_are_never_emitted(self):
+        # They are model-authored free text, not scope. An emitted value can mint a field
+        # it is not, and a benign search whose pattern is a dangerous literal matches a
+        # command-oriented rule.
+        from kiro_crew.hooks import _search_deny_target
+
+        target = _search_deny_target({"path": "/srv", "pattern": "DROP TABLE", "include": "*.sql"})
+        assert target == "file-search path=/srv"
+
+    def test_absent_depth_is_omitted_not_placeholdered(self):
+        # A rule expresses "unbounded" as the ABSENCE of max_depth, so an omitted key
+        # must leave no text behind for a negative lookahead to trip over.
+        from kiro_crew.hooks import _search_deny_target
+
+        assert _search_deny_target({"path": "/srv", "pattern": "*.py"}) == "file-search path=/srv"
+
+    def test_zero_depth_cap_is_emitted(self):
+        from kiro_crew.hooks import _search_deny_target
+
+        assert "max_depth=0" in _search_deny_target(
+            {"path": "/srv", "pattern": "*.py", "max_depth": 0}
+        )
+
+    def test_camelcased_depth_is_emitted_under_the_canonical_name(self):
+        # kiro-cli echoes some rawInput keys camelCased. Missing that spelling does
+        # not merely lose a field, it INVERTS the rule: an uncapped-search rule would
+        # fire on a search that carries a cap.
+        from kiro_crew.hooks import _search_deny_target
+
+        assert _search_deny_target({"path": "/srv", "pattern": "*.py", "maxDepth": 2}) == (
+            "file-search path=/srv max_depth=2"
+        )
+
+    def test_camelcased_path_is_emitted_under_the_canonical_name(self):
+        from kiro_crew.hooks import _search_deny_target
+
+        assert _search_deny_target({"filePath": "/srv", "pattern": "*.py"}) == (
+            "file-search path=/srv"
+        )
+
+    def test_boolean_depth_is_not_emitted(self):
+        # `bool` is an `int` subclass; a boolean depth is meaningless and no rule
+        # could match it sensibly.
+        from kiro_crew.hooks import _search_deny_target
+
+        assert "max_depth" not in _search_deny_target(
+            {"path": "/srv", "pattern": "*.py", "max_depth": True}
+        )
+
+    @pytest.mark.parametrize(
+        "path,expected",
+        [
+            ("/srv/a b", "file-search path=/srv/a%20b"),  # whitespace mints a boundary
+            ("/srv/x=1", "file-search path=/srv/x%3D1"),  # `=` mints a field name
+            ("/srv/100%", "file-search path=/srv/100%25"),  # escaped first, unambiguous
+            ("/srv max_depth=1", "file-search path=/srv%20max_depth%3D1"),  # the forgery
+        ],
+    )
+    def test_emitted_values_cannot_forge_a_field(self, path, expected):
+        from kiro_crew.hooks import _search_deny_target
+
+        assert _search_deny_target({"path": path, "pattern": "*.py"}) == expected
+
+    def test_recursive_operation_is_search_shaped_without_a_pattern(self):
+        from kiro_crew.hooks import _search_deny_target
+
+        assert _search_deny_target({"operation": "search_symbols", "path": "/srv"}) == (
+            "file-search path=/srv"
+        )
+
+    @pytest.mark.parametrize(
+        "params",
+        [
+            None,
+            {},
+            {"path": "/srv"},  # no pattern and no recursive operation — not a search
+            {"pattern": ""},  # empty pattern
+            {"pattern": 42},  # non-string pattern
+            {"operation": "get_hover", "path": "/srv"},  # non-recursive operation
+            {"pattern": "*.py", "command": "grep -r x /"},  # shell tool
+        ],
+    )
+    def test_non_search_shapes_synthesize_nothing(self, params):
+        from kiro_crew.hooks import _search_deny_target
+
+        assert _search_deny_target(params) == ""
