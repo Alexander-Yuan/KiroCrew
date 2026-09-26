@@ -116,6 +116,7 @@ from kiro_crew.session_compaction import (
     COMPACT_OUTCOME_COMPACTED,
     COMPACT_OUTCOME_RECYCLED,
     COMPACT_OUTCOME_RESTARTED_UNCOMPACTABLE,
+    COMPACT_OUTCOME_WAITING_FOR_SUBAGENTS,
 )
 
 if TYPE_CHECKING:
@@ -1156,6 +1157,10 @@ _AUTO_RESTART_UNCOMPACTABLE_NOTICE = (
     "♻️ Context reached {pct:.0f}% and this backend cannot compact at all, so "
     "the session was restarted. The conversation above is still here; the agent no "
     "longer remembers it."
+)
+_AUTO_COMPACT_WAITING_NOTICE = (
+    "⏸ Auto-compact failed at {pct:.0f}%. The session is waiting for its sub-agents "
+    "to finish before it restarts. Your messages are kept."
 )
 _AUTO_COMPACT_FAILED_NOTICE = (
     "⚠ Auto-compact failed at {pct:.0f}% — will retry after cooldown. "
@@ -5480,7 +5485,9 @@ class DashboardState:
             slot = self.get_slot(slot_key)
             if slot is None:
                 return
-            if not success:
+            if outcome == COMPACT_OUTCOME_WAITING_FOR_SUBAGENTS:
+                template = _AUTO_COMPACT_WAITING_NOTICE
+            elif not success:
                 template = _AUTO_COMPACT_FAILED_NOTICE
             elif outcome == COMPACT_OUTCOME_RESTARTED_UNCOMPACTABLE:
                 template = _AUTO_RESTART_UNCOMPACTABLE_NOTICE
