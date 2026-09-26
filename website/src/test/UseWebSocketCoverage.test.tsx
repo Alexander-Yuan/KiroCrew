@@ -1475,7 +1475,7 @@ describe('useWebSocket frame router', () => {
     expect(stored[0].tool_call_id).toBe('tc-app')
   })
 
-  it('marks a live question card fresh and clears it on resolution', () => {
+  it('stores a live question card under its server identity and clears it on resolution', () => {
     const { ws } = mount()
     act(() => {
       ws.simulateMessage({
@@ -1484,7 +1484,6 @@ describe('useWebSocket frame router', () => {
       })
     })
     expect(chat().pendingQuestions[ACTIVE]?.ask_id).toBe('ask-live')
-    expect(chat().pendingQuestions[ACTIVE]?.cardId).toBeTruthy()
 
     act(() => { ws.simulateMessage({ type: 'question_card_resolved', data: { ask_id: 'ask-live' } }) })
     expect(chat().pendingQuestions[ACTIVE]).toBeUndefined()
@@ -2325,7 +2324,6 @@ describe('useWebSocket frame router', () => {
       slot: ACTIVE,
       card_id: 'card-gone',
       questions: [{ question: 'Stale', options: [{ label: 'x' }] }],
-      fresh: true,
     })
     ;(api.pendingQuestions as ReturnType<typeof vi.fn>).mockResolvedValueOnce([])
     act(() => {
@@ -2342,7 +2340,6 @@ describe('useWebSocket frame router', () => {
       slot: ACTIVE,
       card_id: 'card-old',
       questions: [{ question: 'Old', options: [{ label: 'x' }] }],
-      fresh: true,
     })
     ;(api.pendingQuestions as ReturnType<typeof vi.fn>).mockResolvedValueOnce([
       { card_id: 'card-new', slot: ACTIVE, questions: [{ question: 'New', options: [{ label: 'y' }] }] },
@@ -2365,7 +2362,6 @@ describe('useWebSocket frame router', () => {
       slot: ACTIVE,
       card_id: 'card-live',
       questions: [{ question: 'Still asking', options: [{ label: 'x' }] }],
-      fresh: true,
     })
     ;(api.pendingQuestions as ReturnType<typeof vi.fn>).mockResolvedValueOnce([
       { card_id: 'card-live', slot: ACTIVE, questions: [{ question: 'Still asking', options: [{ label: 'x' }] }] },
@@ -2374,14 +2370,13 @@ describe('useWebSocket frame router', () => {
       globalStore.dispatch(held)
       testStore.dispatch(held as never)
     })
-    const deliveryId = chat().pendingQuestions[ACTIVE]?.cardId
-    expect(deliveryId).toBeTruthy()
+    const entry = chat().pendingQuestions[ACTIVE]
+    expect(entry?.serverCardId).toBe('card-live')
     mount()
     await act(async () => { await Promise.resolve() })
-    expect(chat().pendingQuestions[ACTIVE]?.serverCardId).toBe('card-live')
-    // The SAME entry, not a drop-and-re-add: a fresh per-delivery id would mean
-    // the component remounted, discarding a half-typed answer on every reconnect.
-    expect(chat().pendingQuestions[ACTIVE]?.cardId).toBe(deliveryId)
+    // The SAME entry, not a drop-and-re-add: a replaced entry would reset the
+    // draft protection and let a reconnect discard a half-typed answer.
+    expect(chat().pendingQuestions[ACTIVE]).toBe(entry)
   })
 
   it('restores a stateless card when a queued answer is cancelled', async () => {
@@ -2428,7 +2423,6 @@ describe('useWebSocket frame router', () => {
       slot: ACTIVE,
       card_id: 'card-new',
       questions: [{ question: 'Live', options: [{ label: 'y' }] }],
-      fresh: true,
     })
     mount()
     // Both stores: the hook reads the module store for its snapshots (like the
