@@ -60,6 +60,7 @@ from kiro_crew.monitoring.decision import (
 # outcome ``MonitorObservation`` has no field for, so the marker is the reason code
 # the probe set, and a reason code belongs to the kind that emits it.
 from kiro_crew.monitoring.github_provider_errors import is_unattempted_probe
+from kiro_crew.monitoring.limits import validate_runtime_secs
 from kiro_crew.monitoring.models import (
     MONITOR_BUSY_RETRY_SECS,
     MONITOR_COMPLETION_EVIDENCE_TIMEOUT_SECS,
@@ -2636,6 +2637,7 @@ class AutoNudgeService:
                 # controller happens to hold.
                 if not kind_supports_objective(kind, objective):
                     raise ValueError(f"no monitored kind {kind!r} supports objective {objective!r}")
+                validate_runtime_secs(budgets.max_runtime_secs)
                 monitor = MonitorState(
                     kind=kind,
                     target=target,
@@ -2843,6 +2845,7 @@ class AutoNudgeService:
         loop_id: str | None = None,
         creation_surface: MonitorCreationSurface = MonitorCreationSurface.DASHBOARD,
     ) -> NudgeLoop:
+        validate_runtime_secs(max_runtime_secs, allow_unbounded=True)
         idle_secs = max(_MIN_IDLE_SECS, min(_MAX_IDLE_SECS, int(idle_secs)))
         async with self._lock:
             if admission_check is not None and not admission_check():
@@ -3168,6 +3171,8 @@ class AutoNudgeService:
         expected_generation: int | None = None,
         expect_fingerprint: str | None = None,
     ) -> NudgeLoop | None:
+        if max_runtime_secs is not None:
+            validate_runtime_secs(max_runtime_secs, allow_unbounded=True)
         async with self._lock:
             loop = self._loops.get(loop_id)
             if not loop:
@@ -4536,6 +4541,10 @@ class AutoNudgeService:
                 staged_state.budgets = MonitorBudgets(**values)
             elif budgets is not None:
                 staged_state.budgets = budgets
+            if budgets is not None or (
+                budget_patch is not None and "max_runtime_secs" in budget_patch
+            ):
+                validate_runtime_secs(staged_state.budgets.max_runtime_secs)
             if wake_instructions is not None:
                 staged_state.wake_instructions = wake_instructions
             if reset_baseline:

@@ -2978,6 +2978,16 @@ works as documented in `src/kiro_crew/docs/agents.md`; a crew bound to a name
 whose file is gone falls back to the default spec at session start until it is
 repointed, which is exactly the state the guard exists to prevent reaching.
 
+### Monitor runtime ceiling
+
+The shared policy is `monitoring.max_runtime_secs` (see [config](config.md)).
+Tools and REST creation/updates use `monitoring.limits`; a budget is checked
+only when it is written, and a persisted budget is left as stored on load.
+Legacy general AutoNudge still allows zero as its pre-existing unbounded value;
+monitor tools and structured monitors require a positive finite budget. Raising
+or lowering the policy never rewrites an existing loop's timestamps, runtime or
+active state; a stored budget above the ceiling runs to its stored deadline.
+
 ### Structured monitors
 
 Structured monitors share AutoNudge's one-record-per-session store and timer
@@ -3480,6 +3490,13 @@ The dashboard imports its monitor version, bounded limits, provider kinds, and
 enum vocabularies from `website/src/monitoring/contract.json`; a backend parity
 test compares that artifact to `monitor_frontend_contract()`, so a backend
 contract change cannot land while the normalizer still enforces stale values.
+The contract's `maxRuntimeSecs.maximum` is the absolute bound any install may
+configure and stays the normalizer's acceptance bound for persisted state; the
+runtime the server will actually accept is the live `monitoring.max_runtime_secs`
+ceiling, which `GET /api/monitors/slot/{slot}` reports as
+`max_runtime_ceiling_secs`. The bounded-monitor form validates its runtime input
+against the smaller of the two and falls back to the shipped seven-day ceiling
+while that read is pending or failed.
 Every browser monitor route requires the configured dashboard owner before it
 reads a caller-selected slot or id, parses a mutation body, or touches the
 service. A signed allowed-user dashboard session is not sufficient. A stale
