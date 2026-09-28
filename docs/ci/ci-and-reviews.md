@@ -1446,9 +1446,95 @@ design axis is **what each is allowed to read** (its prompt-injection surface) a
 |---|---|---|---|---|---|
 | Opus 5 | `Opus 5 Review` | Agentic Opus 5 with Opus 4.8 as the overload fallback, `--max-turns 180` per stage, **two real invocations** (discovery -> validation) | **Code only, and no shell**: `Read`, `Grep`, `Glob`. The diff is prefetched to a file, so `Bash(gh pr diff:*)` is not granted -- its prefix match also admits `gh pr diff <n> > <path>`, which a directive in the PR-authored diff could use to overwrite the stage-2 prompt | Line-level correctness, security, AUTOSDE | Yes, fail-closed |
 | GPT 5.6 | `GPT 5.6 Review` | Non-agentic, **two GPT invocations** (discovery, then authoritative falsification), `reasoning_effort: medium`, plus conditional Opus 5 adjudication of blocking candidates | Code plus PR title and body as nonce-wrapped **UNTRUSTED** context | Line-level second perspective, plus description-versus-diff consistency (advisory) | Yes, fail-closed |
-| Design Review | `Design Review` | Agentic Fable 5, with an Opus fallback model | Code plus `gh pr view` (it must judge intent) | Should we build this, and is it the right *shape*? | Advisory; red only on a genuine `BLOCK` |
-| UX Review | `UX Review` | Agentic Fable 5, with the same fallback; **two real invocations** on same-repo PRs (blind read -> reconcile) | Pass 1: the PR's screenshots **only** -- the attachments its body links, downloaded, plus any committed image; pass 2: code, PR text, and pass 1's report | Can a first-time user who has read nothing tell what each new element is and does, and do state changes stay one continuous element? | Advisory; red only on a genuine `BLOCK` |
-| First Principles | `First Principles Review` | Agentic Fable 5, same fallback, `--max-turns 120` (inventorying and counting is grep-heavy) | Code, the whole repository, and `gh pr view` | What is the author trying to do, and does each thing this ships *deserve to exist*, already exist, or only patch a symptom? | Advisory; red only on a genuine `BLOCK` |
+| Design Review | `Design Review` | Agentic Fable 5, with an Opus fallback model | **Code only, and no shell**: `Read`, `Grep`, `Glob`. The diff and the PR title/description are prefetched to the data files `authentic.patch` and `pr-intent.txt`, so no `Bash(...)` is granted -- every such grant is prefix-matched, so one admits `<verb> ... > <path>`, which a directive in the PR-authored diff could use to overwrite this job's own inputs | Should we build this, and is it the right *shape*? | Advisory; red only on a genuine `BLOCK` |
+| UX Review | `UX Review` | Agentic Fable 5, with the same fallback; **two real invocations** on same-repo PRs (blind read -> reconcile) | Pass 1: the PR's screenshots **only** -- the attachments its body links, downloaded, plus any committed image; pass 2: **no shell** (`Read`, `Grep`, `Glob`), reading pass 1's report plus the prefetched `authentic.patch` and `pr-intent.txt` | Can a first-time user who has read nothing tell what each new element is and does, and do state changes stay one continuous element? | Advisory; red only on a genuine `BLOCK` |
+| First Principles | `First Principles Review` | Agentic Fable 5, same fallback, `--max-turns 120` (inventorying and counting is grep-heavy) | **The whole repository, and no shell**: `Read`, `Grep`, `Glob`. The diff and the PR title/description are prefetched to `authentic.patch` and `pr-intent.txt`, for the same prefix-match reason as the rows above | What is the author trying to do, and does each thing this ships *deserve to exist*, already exist, or only patch a symptom? | Advisory; red only on a genuine `BLOCK` |
+
+### The description a verdict read, and the digest that names it
+
+Every lane whose model judges the author's stated intent reads the title and
+description from ONE shared capture, `.github/scripts/pr-description-capture.sh`,
+sourced by `design-review`, `ux-review`, `first-principles-review` and their three
+fork counterparts. The capture runs once per job, writes `pr-intent.txt`, and the
+prompt points the model at that file and at nowhere else.
+
+It is one script rather than a copy per lane because each lane stamps the digest of
+those bytes into its published verdict, under a `### Description read` heading:
+
+    [DESCRIPTION-READ] <sha256>
+
+What that digest is taken over depends on whether the lane's verdict reads anything
+besides the prose, and the heading says which:
+
+| lanes | the stamp is | why |
+|---|---|---|
+| `first-principles-review` and its fork twin | `sha256` of `pr-intent.txt` | the verdict reads the prose and the diff, and the diff is pinned to a commit so it cannot move underneath it |
+| `design-review`, `ux-review` and their fork twins | `sha256` of a **manifest** naming `pr-intent.txt` and each evidence file the lane's model is pointed at | the media strip replaces every attachment URL with the same placeholder, so swapping one attachment for another leaves the prose byte-identical while the reviewer sees different evidence |
+
+The manifest is one `<label> <sha256>` line per input, newline-terminated, in the
+order the lane listed them -- `description`, then `evidence-1`, `evidence-2` and so
+on -- so the composition is reproducible by hand and two evidence files cannot be
+confused for one longer one. An evidence file whose own bytes are per-run paths is
+folded in by its normalized content instead: every line starting with `/` reduced to
+its basename, every other line verbatim. That is what makes the manifest reproducible
+off the runner at all, since the screenshot list and the rendered-evidence manifest
+that embeds it are written as absolute temp paths.
+
+The heading states the evidence count, so a reader knows which of the two forms to
+recompute before concluding anything from a mismatch. The recipe at the top of
+`pr-description-capture.sh` reproduces the `pr-intent.txt` form; against a lane with
+a non-zero count it mismatches by construction rather than because the description
+moved.
+
+#### One read per job
+
+The four lanes that stamp a manifest read that description twice: once in the
+evidence step, through `.github/scripts/pr-attachment-evidence.sh`, and once in
+the capture step. While each script fetched the API itself, a description edited
+between the two steps paired the OLD attachments with the NEW prose, and the
+manifest digest was taken over that pair -- a revision that never existed,
+reported to a reader recomputing it as a match. No later run corrected it,
+because the lanes fire on `opened, synchronize, reopened` and a description edit
+starts none. The window was ordinary: pushing a commit starts the run, and
+pasting a screenshot in the next minute lands inside it.
+
+`.github/scripts/pr-body-snapshot.sh` is now the only place either script reaches
+the API. It fetches the whole pull request once, splits the title and the body out
+of that one response, and caches them under `$RUNNER_TEMP`; whichever consumer
+runs first pays the read and the other reads those same bytes. Keying the cache to
+`$RUNNER_TEMP` makes "one read per job" the default rather than something a lane
+has to opt into, so a lane added later inherits it without wiring. A *later* job
+still reads afresh, which is what keeps a re-run after an edit judging the new
+text. The composed bytes are unchanged from the two-read form, so a digest
+published before this existed still recomputes to the same value.
+
+Two implementations of the media strip or the 8000-byte cap would make the same
+digest mean two different things, and a reader recomputing it would get a mismatch
+from a description nobody had touched.
+
+The digest covers the bytes the MODEL received -- after the media strip and the cap --
+not the raw API body. That is deliberate and it cuts both ways: an edit the strip
+erases cannot change the model's input, so it must not move the digest either, or the
+stamp would report a description the verdict never saw. What the stamp therefore
+answers is one question: has the description changed since this verdict was formed?
+A mismatch means any finding drawn from the description is unproven.
+
+Three properties are load-bearing, and each is pinned:
+
+- The digest is taken at CAPTURE time, so it names what the model was given rather
+  than whatever the description says when the verdict is published. A publish-time
+  digest would match in exactly the window it needs to catch.
+- It is a bare 64-character sha256 or the step fails closed. `sha256sum <file>`
+  escapes a filename containing a backslash and prefixes the line with one, so the
+  digest reads from stdin; a guard that only tested for empty would publish the
+  escaped form, which no reader can reproduce.
+- The capture step runs BEFORE any `configure-aws-credentials` step in its lane. On a
+  same-repo PR the checkout is the merge ref, so a sourced script is the PR's own
+  copy; a session assumed earlier persists for every later step.
+
+A read failure is not a missing description. The capture retries three times and then
+fails the step, naming the read as the cause, rather than handing the reviewer an
+empty file and letting it judge a PR that appears to state no intent.
 
 ### Why a first-principles lane is not a second Design Review
 
