@@ -275,6 +275,51 @@ comparison per member and nothing is remembered between requests. A member with 
 log has no folded state to be stale, so neither reconcile runs for one, which is what
 keeps the roster read free of writes.
 
+That comparison is between two things of different ages, and each side has its own
+guard. The config side is older: `api_members` loads it once and reaches the row loop
+several reads later, so a save landing in between writes `config.json` AND appends its
+own `member/config`, leaving the fold carrying the NEW values while the request still
+holds the old ones — and the comparison then reads the save as drift and appends the
+pre-save snapshot over it, durably, because the fold is last-wins per field. So the
+request loads through `load_config_with_content_stamp`, which returns the config
+together with a digest bound INSIDE the load: the cache entry carries the digest of the
+bytes it was parsed from, so a hit reports its own provenance and a miss reports what
+it just read. A digest read around the load instead is defeated by a replacement
+presenting the same stat fingerprint, because the load then answers from cache while
+those reads hash the new bytes. `reconcile_member_config` takes the digest as a
+REQUIRED argument and refuses unless the live config is still those bytes.
+
+A digest names BYTES, so it is available whenever both files were read whole or were
+absent — "neither file exists" is a valid state with a digest of its own, and a document
+that read whole but would not parse still has bytes to name. Only a read that never
+completed leaves nothing to name, and that load binds no digest.
+
+Currency is therefore not the whole condition. The roster corrects the log FROM the
+config, so it reconciles only while that config is both current AND faithful: a file
+that would not parse leaves field DEFAULTS standing in for what the operator wrote, and
+correcting the log from those defaults would overwrite good values because of a typo —
+the same projection regression the currency check exists to prevent. `degraded_sections`
+is what reports faithfulness, and the roster folds both conditions into the stamp it
+passes, so no row can reach the reconcile without them. The rows still render either
+way; only the correcting write is withheld. The log side is younger
+but can still move: the correcting append goes through
+`append_closer_if_still_applies` with `_config_is_still_at`, so a writer committing
+between the comparison and the write keeps its newer word. All of these refusals are
+ordinary — the next roster read compares afresh.
+
+The startup sweep reconciles through the same single entry, under the same two
+conditions. It cannot meet them from the config object the gateway hands it: that was
+loaded when the gateway was constructed, and the sweep runs later as a background task
+with the HTTP port already listening, so a dashboard save can have landed in between
+and those values are no longer the operator's word. The sweep therefore loads config
+itself, in its own worker thread, and passes that load's digest — so a save that landed
+while the sweep was queued is what reaches the log, rather than being overwritten by
+it. Absent or degraded provenance withholds the member/config write and nothing else:
+the closers below are decided from live process state against the log, never from config
+content, so they still land. There is deliberately no second, exempt entry point — a
+caller that cannot name its bytes must not reconcile, and an exemption reachable by
+passing an empty stamp is one a caller reaches by accident.
+
 It reconciles the roster's `last_message` the same way
 (`eventlog_hooks.reconcile_member_preview`): the transcript's speech-only read is the
 authority, so a fold still quoting a machinery preview written before the preview
