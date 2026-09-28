@@ -96,6 +96,12 @@ REACHES_NETWORK: dict[str, str] = {
 
 #: Routes that answer 503 on a fresh home, and what each names as unavailable.
 #: Exact paths, like every other table here: a 503 elsewhere is a failure.
+#:
+#: ``/api/models`` is deliberately NOT here: this suite's fresh home runs the fake
+#: kiro-cli (``KIROCREW_KIRO_BIN`` in the integration conftest), which answers
+#: ``chat --list-models``, so the route serves a catalog instead of reporting an
+#: empty model list. It is swept by the default rule below — under 500 — which
+#: still fails if it ever starts answering 5xx.
 UNAVAILABLE_ON_A_FRESH_HOME: dict[str, str] = {
     "/api/capability/agents": "capability manager not available",
     "/api/capability/mcp": "capability manager not available",
