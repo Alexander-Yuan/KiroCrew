@@ -5061,6 +5061,7 @@ class _ChatSlot:
             source_links=source_links,
             coordinator_pending=coordinator_pending,
             prompt_roles=_PROMPT_ROLES,
+            transient_roles=_TRANSIENT_ROLES,
             redact=_redact,
             parse_options=_parse_options,
             strip_options=lambda text: _OPTIONS_RE.sub("", text).strip(),
