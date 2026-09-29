@@ -118,7 +118,7 @@ from kiro_crew.mcp_cron import (
     _vet_shell_command,
 )
 from kiro_crew.member_memory_auth import require_member_memory_creation
-from kiro_crew.members import MemberNameError, validate_member_name
+from kiro_crew.members import MemberNameError, key_new_crew, validate_member_name
 from kiro_crew.memory import MemoryStore
 from kiro_crew.memory_stores import (
     DEFAULT_MEMORY_STORE,
@@ -1441,9 +1441,14 @@ def _handle_agent(args: argparse.Namespace) -> None:
         except MemberNameError as exc:
             print(f"Error: invalid Crew Member name ({exc})", file=sys.stderr)
             sys.exit(1)
-        if args.name in cfg.agents:
-            print(f"Error: agent '{args.name}' already exists", file=sys.stderr)
+        # Same keying as POST /api/agents.
+        keyed = key_new_crew(
+            args.name, (getattr(args, "display_name", None) or "").strip(), cfg.agents
+        )
+        if keyed.taken:
+            print(f"Error: agent '{keyed.taken}' already exists", file=sys.stderr)
             sys.exit(1)
+        args.name, display_name = keyed.key, keyed.display_name
         if not TEMPLATE_NAME_RE.fullmatch(args.kiro_agent):
             print("Error: invalid kiro agent name", file=sys.stderr)
             sys.exit(1)
@@ -1463,6 +1468,7 @@ def _handle_agent(args: argparse.Namespace) -> None:
             kiro_agent=args.kiro_agent,
             workspace=args.workspace,
             memory_store=memory_store,
+            display_name=display_name,
         )
         previous_store = cfg.agents[args.name].memory_store
         previous_member_id = cfg.agents[args.name].member_id
@@ -1493,7 +1499,10 @@ def _handle_agent(args: argparse.Namespace) -> None:
                 raise
             print(f"Error: {exc}", file=sys.stderr)
             sys.exit(1)
-        print(f"Created agent: {args.name}")
+        if display_name:
+            print(f"Created agent: {args.name} (display name: {display_name})")
+        else:
+            print(f"Created agent: {args.name}")
 
     elif action == "update":
         if args.name not in cfg.agents:
