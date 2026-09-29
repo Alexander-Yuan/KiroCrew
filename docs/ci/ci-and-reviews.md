@@ -2573,37 +2573,17 @@ Two subtleties:
   cost -- and neither does anything a step does. The only lever on dispatch is which
   events are subscribed.
 
-  So completions are delivered by `pr-readiness-sweep.yml`, on two triggers that are
-  interchangeable because the sweep scans the whole open set whichever fired it: a
-  `*/5` schedule (GitHub's shortest), and **Fast Gate completing**, which is one event per
-  head update -- about a hundred an hour -- and lands while the head's other lanes are
-  still finishing. The second exists because the scheduler is late under load: measured
-  2026-09-27 with ~330 runs queued, the `*/5` tick fired at 07:50 and next at 08:27, and a
-  sibling `*/10` watchdog stretched to 25-minute gaps. Both enter one concurrency group
-  that never cancels the incumbent, so a burst of completions is one queued sweep. The
-  sweep scans every open pull request over GraphQL -- a separate pool from the REST budget
-  the lanes share, a handful of requests for the whole open set -- classifies the whole
-  scan in one `jq` pass (a bash loop over 650 rows spent 480 s, longer than the cadence),
+  So completions are delivered by `pr-readiness-sweep.yml`, every 5 minutes (GitHub's
+  shortest schedule). It scans every open pull request over GraphQL -- a separate pool
+  from the REST budget the lanes share, a handful of requests for the whole open set --
   and dispatches a recompute for exactly the heads on which a monitored check completed
   after the current verdict was published: 37 heads in a measured 15-minute window,
-  against 282 completion events. The scan has two scopes, picked by trigger. A Fast Gate
-  completion -- the delivery path and most ticks -- reads every open pull request's verdict
-  on a light page (100 a page, 7 pages, 19 s at 625 open) and the check evidence only for
-  the pull requests that can be stale on evidence: every `pending`, a terminal verdict on
-  a pull request active inside a six-hour window, and a green verdict whose rollup
-  aggregate is red (117 candidates, 59 s measured). The schedule reads every rollup (25
-  pages, 261 s), which is the one scope that also sees a re-run on a quiet pull request
-  whose `in_progress` event GitHub dropped; the two scopes run in separate concurrency
-  groups so the slow one never queues the fast one. The same six-hour window bounds the
-  disposition-comment read of mode 5, which used to fire for every terminal verdict whose
-  pull request had moved since -- true of 478 of 566 at once, since anything bumps
-  `updatedAt` -- at 500-900 REST requests and three minutes per sweep on the pool the lanes
-  share. A pending is examined once it is at least the publish
+  against 282 completion events. A pending is examined once it is at least the publish
   lag old (180 s), and a check counts as evidence when it completed after the verdict's
   publication minus that same lag; binding the two to one value is what makes a rescue
   self-terminating on the next tick whatever the cadence (`test_pr_readiness_sweep.py`
   pins the pairing and the reasoning). The cost is latency in the safe direction only: a
-  verdict goes green up to one sweep plus the lag later than the event made it, never
+  verdict goes green up to one tick plus the lag later than the event made it, never
   earlier.
 
   `in_progress` stays because it is the one signal completions cannot carry: a monitored
