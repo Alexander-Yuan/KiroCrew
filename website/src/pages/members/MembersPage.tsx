@@ -3190,6 +3190,7 @@ export default function MembersPage() {
                       else setOverlayOpen(true)
                     }}
                     threads={threadHooks}
+                    onFileOpen={openFile}
                   />
                 </ErrorBoundary>
               </div>
