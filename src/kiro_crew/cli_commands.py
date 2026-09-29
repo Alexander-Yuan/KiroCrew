@@ -2059,16 +2059,36 @@ def _cron_dispatch(args: argparse.Namespace) -> None:
                 # first and only falls back to rehydrating from history, so a
                 # brand-new tab that has not logged anything yet is a legitimate
                 # target and absence of a log does not prove the key is wrong.
-                slot = session_key.removeprefix("dashboard:")
+                #
+                # Resolve the transcript the way DELIVERY resolves it, rather
+                # than guessing at the spelling. The original bug was asking for
+                # the prefix-stripped slot, which found nothing for EVERY
+                # dashboard session and warned on every correct adopt -- which
+                # trains the operator to ignore the one message that would also
+                # be a real typo's only signal. Passing the raw session key
+                # instead fixes the common ``chat-N`` spelling but reintroduces
+                # the same false warning for the two spellings where the two
+                # differ: a channel-origin slot (``dashboard:slack_<ts>``, whose
+                # transcript is ``slack_<ts>.jsonl`` with no ``dashboard_``
+                # prefix) and a stacked prefix (``--session-of
+                # dashboard_chat-N-...`` becomes ``dashboard:dashboard_chat-N``).
+                # ``_normalize_slot_key`` + ``slot_transcript_key`` are the pair
+                # the delivery path itself composes, so reusing them keeps the
+                # check and the delivery it predicts from drifting apart.
                 try:
-                    known = ConversationLog().has_log(slot)
+                    from kiro_crew.dashboard.chat_utils import slot_transcript_key
+                    from kiro_crew.dashboard.state import _normalize_slot_key
+
+                    transcript_key = slot_transcript_key(_normalize_slot_key(session_key))
+                    known = ConversationLog().has_log(transcript_key)
                 except Exception:
                     known = True  # cannot tell -> stay quiet rather than cry wolf
                 if not known:
                     print(
-                        f"Warning: no recorded session named {slot!r}. If that is a typo, "
-                        f"the job's results will not reach anyone -- re-run with the right "
-                        f"key, or `--release` to undo.",
+                        f"Warning: no recorded session named "
+                        f"{session_key.removeprefix('dashboard:')!r}. If that is a "
+                        f"typo, the job's results will not reach anyone -- re-run "
+                        f"with the right key, or `--release` to undo.",
                         file=sys.stderr,
                     )
             else:
