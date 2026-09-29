@@ -870,6 +870,7 @@ def repair_sentinel_path(raw: str) -> str:
 # on start(); cleared on stop().
 _INSTANCE: "AutoNudgeService | None" = None
 _MAINTENANCE_LOCKS: dict[tuple[asyncio.AbstractEventLoop, str], asyncio.Lock] = {}
+_MUTATION_LOCK_OWNERS: dict[asyncio.Lock, asyncio.Task[Any]] = {}
 
 
 def _maintenance_lock(base_dir: Path) -> asyncio.Lock:
@@ -877,6 +878,31 @@ def _maintenance_lock(base_dir: Path) -> asyncio.Lock:
     loop = asyncio.get_running_loop()
     path_key = os.path.normcase(os.path.abspath(str(base_dir)))
     return _MAINTENANCE_LOCKS.setdefault((loop, path_key), asyncio.Lock())
+
+
+def _claim_mutation_lock(lock: asyncio.Lock) -> None:
+    # Explicit checks, not asserts: asserts vanish under ``python -O``.
+    owner = asyncio.current_task()
+    if owner is None or not lock.locked():
+        raise RuntimeError("mutation lock must be held by the caller")
+    if lock in _MUTATION_LOCK_OWNERS:
+        raise RuntimeError("mutation lock already has an owner")
+    _MUTATION_LOCK_OWNERS[lock] = owner
+
+
+def _assert_mutation_lock_owned(lock: asyncio.Lock) -> None:
+    if not (lock.locked() and _MUTATION_LOCK_OWNERS.get(lock) is asyncio.current_task()):
+        raise RuntimeError("mutation lock must be held by the caller")
+
+
+def _unclaim_mutation_lock(lock: asyncio.Lock) -> None:
+    _assert_mutation_lock_owned(lock)
+    del _MUTATION_LOCK_OWNERS[lock]
+
+
+def _release_mutation_lock(lock: asyncio.Lock) -> None:
+    _unclaim_mutation_lock(lock)
+    lock.release()
 
 
 async def _cancel_and_drain_tasks(*tasks: asyncio.Task[Any]) -> bool:
@@ -2312,21 +2338,26 @@ class AutoNudgeService:
     ) -> AsyncIterator["_AutoNudgeMaintenanceView"]:
         """Yield one authoritative store view, serialized with startup and peers."""
         selected_dir = base_dir or data_home()
-        async with _maintenance_lock(selected_dir):
-            live = _INSTANCE
-            if live is not None and live._base_dir == selected_dir:
-                view = _AutoNudgeMaintenanceView(live)
+        lock = _maintenance_lock(selected_dir)
+        async with lock:
+            _claim_mutation_lock(lock)
+            try:
+                live = _INSTANCE
+                if live is not None and live._base_dir == selected_dir:
+                    view = _AutoNudgeMaintenanceView(live)
+                    try:
+                        yield view
+                    finally:
+                        view._release()
+                    return
+                offline = await cls.load_for_maintenance(base_dir=selected_dir)
+                view = _AutoNudgeMaintenanceView(offline)
                 try:
                     yield view
                 finally:
                     view._release()
-                return
-            offline = await cls.load_for_maintenance(base_dir=selected_dir)
-            view = _AutoNudgeMaintenanceView(offline)
-            try:
-                yield view
             finally:
-                view._release()
+                _unclaim_mutation_lock(lock)
 
     def _serialize_state(self) -> dict:
         """Snapshot the store payload ON THE CALLER'S THREAD.
@@ -2617,6 +2648,7 @@ class AutoNudgeService:
                 lock.release()
                 raise asyncio.CancelledError()
             if loop_id not in self._maintenance_quiescing:
+                _claim_mutation_lock(lock)
                 return lock
             lock.release()
             return None
@@ -3237,7 +3269,16 @@ class AutoNudgeService:
         judge: dict | None = None,
         expected_generation: int | None = None,
         expect_fingerprint: str | None = None,
+        precondition: Callable[[NudgeLoop], bool] | None = None,
+        on_absent: Callable[[], None] | None = None,
     ) -> NudgeLoop | None:
+        """Patch a loop. ``precondition`` is re-taken on the live row under the lock.
+
+        A refused precondition changes nothing and returns ``None``, the same
+        "not applied" answer as a missing row; only the stale-wake stop passes one.
+        ``on_absent`` is called inside the same hold when the row is missing, so
+        that caller can tell a deleted row from a replaced one.
+        """
         # CANCELLATION SAFETY: same contract as add(). The mutate+persist runs
         # as a SHIELDED, supervised task so a caller cancelled mid-write cannot
         # release ``_lock`` while the executor write is still in flight — which
@@ -3256,6 +3297,8 @@ class AutoNudgeService:
                 judge=judge,
                 expected_generation=expected_generation,
                 expect_fingerprint=expect_fingerprint,
+                precondition=precondition,
+                on_absent=on_absent,
             )
         )
         self._inflight_adds.add(inner)
@@ -3344,6 +3387,8 @@ class AutoNudgeService:
         judge: dict | None = None,
         expected_generation: int | None = None,
         expect_fingerprint: str | None = None,
+        precondition: Callable[[NudgeLoop], bool] | None = None,
+        on_absent: Callable[[], None] | None = None,
     ) -> NudgeLoop | None:
         lock = await self._acquire_mutation_lock(loop_id)
         if lock is None:
@@ -3361,9 +3406,11 @@ class AutoNudgeService:
                 judge=judge,
                 expected_generation=expected_generation,
                 expect_fingerprint=expect_fingerprint,
+                precondition=precondition,
+                on_absent=on_absent,
             )
         finally:
-            lock.release()
+            _release_mutation_lock(lock)
 
     async def _update_unserialized(
         self,
@@ -3379,12 +3426,23 @@ class AutoNudgeService:
         judge: dict | None = None,
         expected_generation: int | None = None,
         expect_fingerprint: str | None = None,
+        precondition: Callable[[NudgeLoop], bool] | None = None,
+        on_absent: Callable[[], None] | None = None,
     ) -> NudgeLoop | None:
         if max_runtime_secs is not None:
             validate_runtime_secs(max_runtime_secs, allow_unbounded=True)
         async with self._lock:
             loop = self._loops.get(loop_id)
             if not loop:
+                # Inside the hold, so the caller can inspect the slot before any
+                # concurrent arm or delete can change it.
+                if on_absent is not None:
+                    on_absent()
+                return None
+            # Same contract as ``_remove_unserialized``: the caller's decision is
+            # re-taken on the live row inside the ``_lock`` hold that mutates it,
+            # so a pause that landed while this call waited cannot be overwritten.
+            if precondition is not None and not precondition(loop):
                 return None
             # ATOMIC generation fence (inside _lock, before any mutation): a
             # caller applying a structural-terminal stop passes the generation it
@@ -3865,29 +3923,51 @@ class AutoNudgeService:
 
         fut.add_done_callback(_log)
 
-    async def remove(self, loop_id: str, *, stop_reason: str = "", stop_detail: str = "") -> None:
-        """Remove a loop. ``stop_reason``/``stop_detail`` name why, for the stop record."""
+    async def remove(
+        self,
+        loop_id: str,
+        *,
+        precondition: Callable[[NudgeLoop], bool] | None = None,
+        on_absent: Callable[[], None] | None = None,
+        stop_reason: str = "",
+        stop_detail: str = "",
+    ) -> bool:
+        """Remove a loop if its live row satisfies ``precondition`` under the lock."""
         lock = await self._acquire_mutation_lock(loop_id)
         if lock is None:
-            return
+            return False
         try:
-            await self._remove_unserialized(
-                loop_id, stop_reason=stop_reason, stop_detail=stop_detail
+            return await self._remove_unserialized(
+                loop_id,
+                precondition=precondition,
+                on_absent=on_absent,
+                stop_reason=stop_reason,
+                stop_detail=stop_detail,
+                mutation_lock=lock,
             )
         finally:
-            lock.release()
+            _release_mutation_lock(lock)
 
     async def remove_by_slot(self, slot_key: str) -> NudgeLoop | None:
         """Retire the current slot generation inside one maintenance transaction."""
-        async with _maintenance_lock(self._base_dir):
-            loop = self._find_by_slot(slot_key)
-            if loop is None:
-                return None
-            if is_structured_monitor_loop(loop):
-                await self.retire_monitor_for_session_close(loop.id)
-            else:
-                await self._remove_unserialized(loop.id, stop_reason="session_closed")
-            return loop
+        lock = _maintenance_lock(self._base_dir)
+        async with lock:
+            _claim_mutation_lock(lock)
+            try:
+                loop = self._find_by_slot(slot_key)
+                if loop is None:
+                    return None
+                if is_structured_monitor_loop(loop):
+                    await self.retire_monitor_for_session_close(loop.id)
+                else:
+                    await self._remove_unserialized(
+                        loop.id,
+                        stop_reason="session_closed",
+                        mutation_lock=lock,
+                    )
+                return loop
+            finally:
+                _unclaim_mutation_lock(lock)
 
     async def clear_terminal_monitor(self, monitor_id: str) -> bool:
         """Remove a structured monitor row ONLY while it is still terminal.
@@ -3917,17 +3997,23 @@ class AutoNudgeService:
         if lock is None:
             return False
         try:
-            return await self._remove_unserialized(monitor_id, precondition=_still_terminal)
+            return await self._remove_unserialized(
+                monitor_id,
+                precondition=_still_terminal,
+                mutation_lock=lock,
+            )
         finally:
-            lock.release()
+            _release_mutation_lock(lock)
 
     async def _remove_unserialized(
         self,
         loop_id: str,
         *,
         precondition: Callable[[NudgeLoop], bool] | None = None,
+        on_absent: Callable[[], None] | None = None,
         stop_reason: str = "",
         stop_detail: str = "",
+        mutation_lock: asyncio.Lock | None = None,
     ) -> bool:
         """Remove one loop. Returns whether the removal happened.
 
@@ -3938,15 +4024,27 @@ class AutoNudgeService:
         ``precondition`` is evaluated on the LIVE row inside the same ``_lock``
         hold that removes it, so a caller whose decision was taken before an
         await can re-take it atomically here instead of racing whatever landed
-        in between. A refused precondition changes nothing.
+        in between. A refused precondition changes nothing. ``on_absent`` is
+        called inside the same hold when the row is missing.
         """
+        if mutation_lock is None:
+            raise RuntimeError("mutation lock must be held by the caller")
+        _assert_mutation_lock_owned(mutation_lock)
+        if mutation_lock is not _maintenance_lock(self._base_dir):
+            raise RuntimeError("mutation lock must be the service maintenance lock")
         async with self._lock:
             existed = loop_id in self._loops
             if not existed and loop_id not in self._pending_removals:
+                if on_absent is not None:
+                    on_absent()
                 return False
             current = self._loops.get(loop_id)
             if precondition is not None:
-                if current is None or not precondition(current):
+                if current is None:
+                    if on_absent is not None:
+                        on_absent()
+                    return False
+                if not precondition(current):
                     return False
             restore_provider_credentials = False
             if existed:
@@ -7002,7 +7100,7 @@ class AutoNudgeService:
                     )
                     return False
             finally:
-                settle_lock.release()
+                _release_mutation_lock(settle_lock)
             self._emit("expired", loop)
             return True
 
@@ -7786,7 +7884,7 @@ class AutoNudgeService:
                         else:
                             self._emit("expired", loop)
                 finally:
-                    settle_lock.release()
+                    _release_mutation_lock(settle_lock)
         if claimed_wake and delivered and loop.monitor is not None:
             # The turn happened, so it is a wake, and only now does the agent own
             # work the probe cannot see -- which is what the follow-up allowance
@@ -8015,6 +8113,7 @@ class _AutoNudgeMaintenanceView:
             return False
 
     async def remove(self, loop_id: str) -> None:
-        await self._service._remove_unserialized(loop_id)
+        lock = _maintenance_lock(self._service._base_dir)
+        await self._service._remove_unserialized(loop_id, mutation_lock=lock)
         self._service._end_maintenance_quiesce(loop_id)
         self._quiescing.discard(loop_id)
