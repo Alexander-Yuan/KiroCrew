@@ -196,6 +196,7 @@ from kiro_crew.subagent_manager.monitoring import (  # noqa: F401 - resolved by 
     tombstone_recovery_action,
 )
 from kiro_crew.subagent_persistence import (  # noqa: F401 - read_tombstone resolved by run.py via bind_component_globals
+    DISMISSAL_FAILED,
     _agent_dir,
     _cleanup_session_files_sync,
     _subagents_dir,
@@ -207,7 +208,9 @@ from kiro_crew.subagent_persistence import (  # noqa: F401 - read_tombstone reso
     prune_stale_tombstones,
     read_state,
     read_tombstone,
+    record_panel_dismissal_outcome,
     record_slow_command,
+    settle_delivered_batch,
     update_state,
     write_result_chunk,
     write_tombstone,
@@ -4326,6 +4329,24 @@ class SubagentManager:
                 self._clear_report_failure(snapshot)
             elif owner:
                 self.discard_report_failures(info.parent_session_key, owner)
+        # The pop is only half of a dismissal. The panel's durable half reads run
+        # folders, so without a record of its own the next rebuild found this
+        # run's folder and sent the card again -- the dismissal lasted exactly as
+        # long as the process. Recorded here rather than in the route so the two
+        # halves cannot come apart, and OFF the loop, because the record is a
+        # synchronous file write and this is a coroutine.
+        #
+        # Written BEFORE the pop, because the pop is the PUBLISH. With the write
+        # second, an unwritable store still popped the run and still answered
+        # "delivered", which the DELETE route reports as success -- and the card
+        # came back on the next reconnect with nothing to explain it. A failed
+        # write now returns the retryable result this coroutine already uses
+        # above, leaving the run in the manager so the operator can dismiss it
+        # again. The two falsy cases are NOT the same: a run with no folder has
+        # nothing durable to resurrect its card, so its dismissal stands.
+        outcome = await asyncio.to_thread(record_panel_dismissal_outcome, agent_id)
+        if outcome == DISMISSAL_FAILED:
+            return "pending"
         self._agents.pop(agent_id, None)
         self._tasks.pop(agent_id, None)
         return "delivered"
@@ -5398,8 +5419,8 @@ class SubagentManager:
     async def settle_queued_delivery(self, deliveries: list[SubagentDelivery]) -> None:
         return await self._waves.settle_queued_delivery_impl(deliveries)
 
-    def _settle_digest_holds(self, info: SubagentInfo) -> None:
-        return self._waves._settle_digest_holds_impl(info)
+    async def _settle_digest_holds(self, info: SubagentInfo) -> None:
+        return await self._waves._settle_digest_holds_impl(info)
 
     def get(self, agent_id: str) -> SubagentInfo | None:
         return self._run_events.get_impl(agent_id)
@@ -5892,6 +5913,7 @@ _COMPONENT_GLOBAL_BINDINGS = (
     redact_exfiltration_urls,
     run_in_embed_pool,
     sel,
+    settle_delivered_batch,
     single_completion_meta,
     stage_boundary_owner_for_run,
     subprocess_executor,
