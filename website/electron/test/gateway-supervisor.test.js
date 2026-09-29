@@ -2843,3 +2843,73 @@ test("the conflict prompt quits the other family's app through AppleScript by NA
   assert.deepStrictEqual(osascript[0].options, { timeout: 10000 });
   assert.strictEqual(spawnCalls.length, 1, "the released port is spawned into");
 });
+
+
+function staleWarningHarness({ response = 0, parentPid = 99 } = {}) {
+  const requests = [];
+  const dialogs = [];
+  const instance = harness({
+    app: { isPackaged: true, getVersion: () => "0.7.1" },
+    processRef: {
+      platform: "darwin", arch: "arm64", env: {}, resourcesPath: "/virtual/resources",
+      kill() { throw new Error("stale warning must not signal the gateway"); },
+    },
+    httpMod: {
+      get(url, _options, callback) {
+        requests.push(String(url));
+        const req = new EventEmitter();
+        req.destroy = () => {};
+        queueMicrotask(() => {
+          const res = new EventEmitter();
+          res.statusCode = 200;
+          res.resume = () => {};
+          callback(res);
+          res.emit("data", JSON.stringify(url.endsWith("/api/ready")
+            ? { ready: true }
+            : { app: "kirocrew", version: "0.7.0" }));
+          res.emit("end");
+        });
+        return req;
+      },
+    },
+    execFileFn(file, args, _options, callback) {
+      if (file.endsWith("lsof")) callback(null, "123", "");
+      else if (args.includes("ppid=")) callback(null, String(parentPid), "");
+      else callback(null, "/virtual/resources/backend-dist/bin/python -m kiro_crew gateway", "");
+    },
+    dialog: { async showMessageBox(options) { dialogs.push(options); return { response }; } },
+  });
+  return { ...instance, requests, dialogs };
+}
+
+test("a stale bundled gateway warns and continues without requesting a restart", async () => {
+  const state = staleWarningHarness();
+  assert.equal(await state.supervisor.start(), true);
+  assert.equal(state.spawnCalls.length, 0);
+  assert.equal(state.dialogs.length, 1);
+  assert.equal(state.dialogs[0].message, "The gateway is still running an older version.");
+  assert.match(state.dialogs[0].detail, /app is version 0\.7\.1/);
+  assert.match(state.dialogs[0].detail, /gateway is still running version 0\.7\.0/);
+  assert.match(state.dialogs[0].detail, /Run this command in Terminal:\nkirocrew stop --port 5476/);
+  assert.doesNotMatch(state.dialogs[0].detail, /[“”]/);
+  assert.deepEqual(state.dialogs[0].buttons, ["Continue with existing gateway", "Quit"]);
+  assert.deepEqual(state.requests, [
+    "http://localhost:5476/api/status",
+    "http://localhost:5476/api/health",
+    "http://localhost:5476/api/ready",
+  ]);
+});
+
+test("a stale bundled gateway warning honors Quit", async () => {
+  const state = staleWarningHarness({ response: 1 });
+  assert.equal(await state.supervisor.start(), false);
+  assert.equal(state.spawnCalls.length, 0);
+  assert.equal(state.dialogs.length, 1);
+});
+
+test("a service-owned stale bundle adds conditional service recovery guidance", async () => {
+  const state = staleWarningHarness({ parentPid: 1 });
+  assert.equal(await state.supervisor.start(), true);
+  assert.match(state.dialogs[0].detail, /If the gateway starts again automatically/);
+  assert.match(state.dialogs[0].detail, /stop or update the service that restarts it/);
+});

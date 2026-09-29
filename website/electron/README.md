@@ -16,7 +16,13 @@ The app will:
 1. Reuse an existing gateway if one is already reachable and actually serving
    (`/api/ready` 200) — a gateway draining after `/api/shutdown` still answers
    `/api/status`, so it is never adopted; the app waits for the port to clear
-   and spawns fresh instead
+   and spawns fresh instead. Before reusing a same-family gateway on a fixed-path
+   POSIX install, the app detects whether its sole listener is an older gateway
+   from the current bundled backend path. If so, it warns that updated features
+   may be unavailable and offers Continue or Quit, with instructions to stop the
+   old gateway before reopening the app. It does not restart or force-stop the
+   gateway automatically. Remote tunnels, separate CLI installs, unknown owners,
+   same or newer versions, Windows, and moved AppImages retain existing behavior
 2. Launch `kirocrew gateway` when needed
 3. Show a loading screen while the backend boots. A live bundled backend gets an
    extended Windows cold-start window; a child that actually exits still fails

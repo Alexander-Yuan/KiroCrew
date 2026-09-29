@@ -544,8 +544,17 @@ When the app starts, [`main.js`](../../website/electron/main.js) composes the
 desktop lifecycle and delegates gateway ownership to
 [`gateway-supervisor.js`](../../website/electron/gateway-supervisor.js). The
 supervisor first checks whether a gateway is already running. An existing
-gateway—including a local SSH forward to a remote gateway—is reused. Otherwise
-it locates the backend binary via
+gateway, including a local SSH forward to a remote gateway, is reused. Before
+reusing a same-family local gateway on a fixed-path POSIX install, the shell
+checks whether its sole listener is running from this app's current bundled
+backend path. If that bundled gateway reports an older version than the app,
+the shell warns that updated features may be unavailable and offers Continue or
+Quit. The warning explains how to stop the old gateway before reopening the
+app; it adds service guidance only when the listener is service-classified.
+Unknown owners, remote tunnels, separate CLI installs, same or newer versions,
+Windows, and moved AppImages keep the existing reuse behavior. The shell does
+not restart or force-stop a stale gateway automatically. Otherwise it locates
+the backend binary via
 [`find-bin.js`](../../website/electron/find-bin.js), spawns it as `kirocrew
 gateway --no-open`, polls `/api/status`, and loads the dashboard once it is
 healthy.
