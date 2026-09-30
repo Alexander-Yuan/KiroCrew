@@ -46,7 +46,7 @@
  */
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useLocation, useNavigate, useSearchParams } from 'react-router-dom'
-import { ArrowLeft, Check, ChevronRight, Circle, Goal, LayoutDashboard, ListChecks, MessageCircleQuestionMark, NotebookPen, Pencil, Plus, RotateCw, Route, Sparkles, Square, Star, Users, Zap } from 'lucide-react'
+import { ArrowLeft, Check, ChevronRight, Circle, Goal, LayoutDashboard, ListChecks, MessageCircleQuestionMark, NotebookPen, Plus, RotateCw, Route, Sparkles, Square, Star, Users, Zap } from 'lucide-react'
 import { PanelRightSolid } from '../../components/icons/panels'
 import { Btn } from '../../components/ui'
 import { CrewMemberMark } from '../../components/CrewMemberMark'
@@ -82,6 +82,7 @@ import { emitSlotRead, flushSlotRead } from '../../lib/slotReadRelay'
 import { setViewedThreadSlot, clearViewedThreadSlot } from '../../lib/viewedThread'
 import CrewAvatar from '../../components/CrewAvatar'
 import CrewStateAvatar from '../../components/CrewStateAvatar'
+import Glass from '../../components/Glass'
 import ChatPane from '../../components/ChatPane'
 import type { ThreadHooks } from '../../app-sdk/messageRenderers'
 import { threadsApi, threadsQueryKey } from '../../api/threads'
@@ -2946,66 +2947,94 @@ export default function MembersPage() {
             {/* No rule under the header: it shares the transcript's background
                 and is set off by spacing alone, the way ChatPage's session
                 header sits over its transcript (bg-bg, no border-b). A hairline
-                here read as a second frame inside the pane (issue #9425). */}
-            <header className="flex items-center gap-2.5 px-4 py-2" data-testid="member-thread-header">
-              <button
-                // Back to the roster. When this entry was pushed from the
-                // roster on this page, pop it — the browser's own Back then
-                // lands on whatever preceded the roster, with no duplicate
-                // roster entry. A deep link (no such state) has no roster
-                // entry behind it, so drop the param in place instead.
-                onClick={() => {
-                  if ((location.state as { fromRoster?: boolean } | null)?.fromRoster) navigate(-1)
-                  else setSearchParams({}, { replace: true })
-                }}
-                className="md:hidden inline-flex items-center p-1 -ml-1 rounded hover:bg-accent/40"
-                aria-label={t('pages.membersPage.title')}
-                data-testid="member-back"
-              >
-                <ArrowLeft size={16} className="lucide-inline" />
-              </button>
-              {/* The face is just the face on a chat surface — no hover
-                  scrim, no pencil badge: #9116 tried making the avatar the
-                  edit entry here and it read as an oversized "Edit avatar"
-                  control sitting in the conversation (issue #9425). It is the
-                  same reactive CrewStateAvatar as before. */}
-              <CrewStateAvatar
-                seed={active.name}
-                avatar={active.avatar}
-                slotKey={activeSlot || active.slot_key}
-                running={!!isRunning(active)}
-                size={30}
-                working="full"
-              />
-              {/* Title row = name + a small pencil to its RIGHT. That pencil is
-                  the member's edit entry: invisible at rest, it fades in when
-                  the pointer is over the title row (or the button has focus),
-                  and under (hover: none) it sits at low contrast permanently
-                  — a touch user can never hover it into view. The click opens
-                  the member's WHOLE editor in the crew manager — name,
-                  template, model, workspace, triggers, avatar — not just the
-                  avatar builder, so the label says "Edit member". It navigates
-                  rather than editing here: this page never becomes a second
-                  writer (issue #9103). `group/title` is scoped to this row so
-                  the drawer toggle to the right does not reveal it. */}
-              <div className="group/title min-w-0 flex-1 flex items-center gap-1.5" data-testid="member-title-row">
-                <div className="text-[13.5px] font-semibold truncate">{crewDisplayName(active)}</div>
-                {/* The ID stays visible when a label covers it — routes, crons
-                    and spawn params address the ID, never the label. */}
-                {crewDisplayName(active) !== active.name && (
-                  <div className="text-[11px] font-mono text-muted truncate max-w-[11rem]" title={t('components.agentSelector.agent_id_tooltip', { name: active.name })}>{active.name}</div>
-                )}
+                here read as a second frame inside the pane (issue #9425).
+                Three columns, the outer two equal, so the identity pill in the
+                middle is centred on the pane whether or not the back button
+                (narrow) or the panel opener (docked, panel hidden) is present:
+                a flex row with `flex-1` around the pill would shift it by the
+                width of whichever side control is missing. */}
+            <header className="grid grid-cols-[1fr_minmax(0,auto)_1fr] items-center gap-2 px-3 py-2" data-testid="member-thread-header">
+              <div className="flex items-center justify-start min-w-0">
                 <button
-                  type="button"
-                  onClick={() => navigate(crewEditPath(active.name))}
-                  className="inline-flex shrink-0 items-center justify-center w-6 h-6 rounded-md text-muted hover:text-text hover:bg-bg-hover cursor-pointer focus-ring opacity-0 transition-opacity duration-150 motion-reduce:transition-none group-hover/title:opacity-100 focus-visible:opacity-100 [@media(hover:none)]:opacity-60"
-                  aria-label={t('pages.membersPage.edit_member')}
-                  title={t('pages.membersPage.edit_member')}
-                  data-testid="member-edit-name-button"
+                  // Back to the roster. When this entry was pushed from the
+                  // roster on this page, pop it — the browser's own Back then
+                  // lands on whatever preceded the roster, with no duplicate
+                  // roster entry. A deep link (no such state) has no roster
+                  // entry behind it, so drop the param in place instead.
+                  onClick={() => {
+                    if ((location.state as { fromRoster?: boolean } | null)?.fromRoster) navigate(-1)
+                    else setSearchParams({}, { replace: true })
+                  }}
+                  className="md:hidden inline-flex items-center p-1 -ml-1 rounded hover:bg-accent/40"
+                  aria-label={t('pages.membersPage.title')}
+                  data-testid="member-back"
                 >
-                  <Pencil size={13} className="lucide-inline" />
+                  <ArrowLeft size={16} className="lucide-inline" />
                 </button>
               </div>
+              {/* The identity pill: one centred Glass chip holding the face and
+                  the name, the same material as the composer dock and the
+                  follow-up chips (components/Glass.tsx), so the crewmate's name
+                  reads as a floating title over its own thread rather than a
+                  left-aligned toolbar label. The chip solidifies with the rest
+                  of the glass when the Translucent-panels setting is off or
+                  the platform reduces transparency. Only the pill carries the
+                  material — the side controls stay bare so the header has one
+                  pane, not three.
+
+                  The pill IS the member's edit entry: the whole chip is one
+                  button (the pane's host, `as="button"`, so the material and
+                  the control are the same element) that opens the member's
+                  WHOLE editor in the crew manager — name, template, model,
+                  workspace, triggers, avatar — so the label says "Edit
+                  crewmate". It navigates rather than editing here: this page
+                  never becomes a second writer (issue #9103). There is no
+                  separate pencil: the maintainer dropped the hover-revealed
+                  pencil that used to sit right of the name (#9425) once the
+                  identity became one clickable pill — a chip that already reads
+                  as a control does not need a second control inside it. The
+                  face is still not an edit control of its own (#9116): it is a
+                  plain face inside the pill, and the pill's label names the
+                  editor, not the avatar. No hover step: the pane is the same
+                  glass at rest and under the pointer (maintainer decision --
+                  the Glass material carries no hover state of its own), so the
+                  pointer cursor and the tooltip are the affordance; focus is
+                  the app's own ring. The button's accessible NAME is its content — the
+                  crewmate's name — so a screen reader still hears who the
+                  thread is with and voice control can say the name; what the
+                  click does ("Edit crewmate") rides along as the tooltip,
+                  which doubles as the accessible description. An aria-label
+                  would replace the identity with the verb. */}
+              <Glass
+                as="button"
+                type="button"
+                variant="chip"
+                radius={999}
+                onClick={() => navigate(crewEditPath(active.name))}
+                className="glass-shadow flex items-center gap-2.5 pl-2.5 pr-4 py-1.5 min-w-0 max-w-full justify-self-center cursor-pointer text-left focus-ring"
+                title={t('pages.membersPage.edit_member')}
+                data-testid="member-identity-pill"
+              >
+                {/* The same reactive CrewStateAvatar as before — a plain face,
+                    no scrim, no badge (issue #9425). */}
+                <CrewStateAvatar
+                  seed={active.name}
+                  avatar={active.avatar}
+                  slotKey={activeSlot || active.slot_key}
+                  running={!!isRunning(active)}
+                  size={30}
+                  working="full"
+                />
+                {/* Title row = name (+ the ID when a label covers it). */}
+                <div className="min-w-0 flex items-center gap-1.5" data-testid="member-title-row">
+                  <div className="text-[13.5px] font-semibold truncate max-w-[24rem]">{crewDisplayName(active)}</div>
+                  {/* The ID stays visible when a label covers it — routes, crons
+                      and spawn params address the ID, never the label. */}
+                  {crewDisplayName(active) !== active.name && (
+                    <div className="text-[11px] font-mono text-muted truncate max-w-[11rem]" title={t('components.agentSelector.agent_id_tooltip', { name: active.name })}>{active.name}</div>
+                  )}
+                </div>
+              </Glass>
               {/* The panel's opener. Same icon and hit-target as the chat
                   page's side-panel toggle, so the two surfaces teach one
                   gesture, and the dashboard's side-panel chord fires it too.
@@ -3017,21 +3046,22 @@ export default function MembersPage() {
                   construction (a server invariant, not a per-thread state), so
                   announcing it taught the user a term for a thing that can
                   never be otherwise. The member's edit entry is not a peer of
-                  this toggle: it is the pencil inside the title row, revealed
-                  on hover. */}
-              {showOpener && (
-                <button
-                  onClick={togglePanel}
-                  className="flex items-center justify-center w-7 h-7 rounded-md transition-colors bg-transparent border-none shrink-0 text-muted hover:text-text hover:bg-bg-hover cursor-pointer"
-                  aria-pressed={panelVisible}
-                  aria-controls="member-side-panel"
-                  aria-label={t('pages.membersPage.details')}
-                  title={t('pages.membersPage.details')}
-                  data-testid="member-panel-toggle"
-                >
-                  <PanelRightSolid size={15} />
-                </button>
-              )}
+                  this toggle: it is the identity pill in the middle. */}
+              <div className="flex items-center justify-end min-w-0">
+                {showOpener && (
+                  <button
+                    onClick={togglePanel}
+                    className="flex items-center justify-center w-7 h-7 rounded-md transition-colors bg-transparent border-none shrink-0 text-muted hover:text-text hover:bg-bg-hover cursor-pointer"
+                    aria-pressed={panelVisible}
+                    aria-controls="member-side-panel"
+                    aria-label={t('pages.membersPage.details')}
+                    title={t('pages.membersPage.details')}
+                    data-testid="member-panel-toggle"
+                  >
+                    <PanelRightSolid size={15} />
+                  </button>
+                )}
+              </div>
             </header>
             {/* A failed document read from the panel's Files / Artifacts tabs.
                 Reported here, above the thread, rather than inside the tab
