@@ -84,7 +84,11 @@ from kiro_crew.dashboard.chat_utils import (
     effective_session_key,
     slot_history_key,
 )
-from kiro_crew.dashboard.create_rate_limit import SESSION_CREATE, allow_create
+from kiro_crew.dashboard.create_rate_limit import (
+    SESSION_CREATE,
+    allow_create,
+    has_create_budget,
+)
 from kiro_crew.dashboard.state import (
     MAX_LIVE_SLOTS,
     MAX_SLOTS_PER_CREATOR,
@@ -1712,6 +1716,7 @@ async def create_session(
     folder_id: str = "",
     model: str = "",
     caller_fenced: bool | None = None,
+    dry_run: bool = False,
 ) -> dict[str, Any]:
     """Open a new session in the caller's workspace, persisted at birth.
 
@@ -1764,6 +1769,15 @@ async def create_session(
     coroutine suspends many times before it is consulted. ``None`` means "not
     settled", and the fence is then evaluated inline. It is read by the
     private-store authorization below and nothing else.
+
+    ``dry_run`` runs every gate up to the allocation, including the two slot
+    ceilings, and returns ``{"dry_run": True}`` instead of minting a slot. It
+    spends no rate-limit token and writes nothing. The MCP ``session_create``
+    asks it first when its ``folder`` path still has segments to create, so a
+    create that would be refused is refused BEFORE any folder exists: without
+    it the path walk's folders outlive the refusal as empty sidebar rows.
+    ``folder_id`` is then the deepest folder that already exists, which is the
+    one the new segments would inherit a project directory from.
     """
     caller_key = caller_slot_key(state, caller_session_key)
     if not caller_key:
@@ -2293,7 +2307,15 @@ async def create_session(
     # state: a lifetime quota means nothing across a restart unless every
     # rehydrate path carries its attribution, while a five-minute window buys a
     # restart one window rather than a clean slate.
-    if not allow_create(SESSION_CREATE, caller_key):
+    #
+    # A dry run asks the same question without spending the token: a preview
+    # must not use up the create it previews.
+    admitted = (
+        has_create_budget(SESSION_CREATE, caller_key)
+        if dry_run
+        else allow_create(SESSION_CREATE, caller_key)
+    )
+    if not admitted:
         raise SessionControlError(
             "too many sessions created recently; retry shortly",
             code="create_rate_limited",
@@ -2317,6 +2339,12 @@ async def create_session(
             code="creator_slot_cap_reached",
             status=429,
         )
+    # The dry run ends HERE, after the last refusal and before the first write.
+    # Any new refusal gate belongs above this line, or the preview would pass a
+    # create the real call then refuses, and the MCP path walk would leave the
+    # folders it made for that create empty.
+    if dry_run:
+        return {"dry_run": True}
 
     # The agent rides in the constructor rather than being assigned afterwards, for
     # the same reason: it decides which workspace actually EXECUTES the turn, so it

@@ -198,10 +198,11 @@ def _tool_definitions() -> list[dict[str, Any]]:
                 "Omit ``parent`` (or pass 'root') for a top-level folder. Creating a "
                 "folder never moves anything — file sessions into it with "
                 "chat_folder_move_session. An app agent may create at the top level "
-                "or inside a folder it created itself, and the new folder belongs to "
-                "it; creating inside one of the person's folders is refused. A crew "
-                "member follows the same rule: it owns the folders it creates and "
-                "may nest only under its own."
+                "inside a folder it created itself, or directly inside the folder "
+                "its own session is filed in; the new folder belongs to it. Creating "
+                "anywhere else in the person's folders is refused. A crew member "
+                "follows the same rule. An existing same-name folder of yours is "
+                "reused; one that is not yours is refused, never duplicated."
             ),
             "inputSchema": {
                 "type": "object",
@@ -1333,7 +1334,12 @@ def _ambiguous_segment_error(seg: str, matches: list[dict]) -> str:
 
 
 def _resolve_chat_folder_ref(
-    ref: str, folders: list[dict], *, create_missing: bool, session_key: str | None = None
+    ref: str,
+    folders: list[dict],
+    *,
+    create_missing: bool,
+    session_key: str | None = None,
+    before_create: Callable[[str], str | None] | None = None,
 ) -> tuple[str, list[str], str | None]:
     """Resolve a sidebar-folder reference to a folder id. THE resolution chokepoint.
 
@@ -1387,7 +1393,11 @@ def _resolve_chat_folder_ref(
     # the two readings are compared would mutate the tree on a reference we are
     # about to refuse.
     walked, created, walk_err = _walk_chat_folder_segments(
-        ref, folders, create_missing=create_missing and not exact, session_key=session_key
+        ref,
+        folders,
+        create_missing=create_missing and not exact,
+        session_key=session_key,
+        before_create=before_create,
     )
     if walk_err:
         return "", created, walk_err
@@ -1414,7 +1424,12 @@ def _resolve_chat_folder_ref(
 
 
 def _walk_chat_folder_segments(
-    ref: str, folders: list[dict], *, create_missing: bool, session_key: str | None = None
+    ref: str,
+    folders: list[dict],
+    *,
+    create_missing: bool,
+    session_key: str | None = None,
+    before_create: Callable[[str], str | None] | None = None,
 ) -> tuple[str, list[str], str | None]:
     """Walk a ``/``-separated path segment by segment. ONE walk, two modes.
 
@@ -1427,11 +1442,31 @@ def _walk_chat_folder_segments(
     ``folders`` is appended in place for each created row so a later path render
     sees it. Created names come back even alongside an error, so a partial
     mkdir -p is reported rather than silently left behind.
+
+    Two checks run before the FIRST folder is created, so a walk that would
+    stop part-way stops with nothing made. Every segment's length is tested up
+    front. ``before_create`` is called once, with the id of the deepest folder
+    that already exists, just before the first create; an error it returns
+    ends the walk there. It is how ``session_create`` asks whether the create
+    itself would be refused before any folder exists for it.
     """
     walked = ""
     parent = ""
     created: list[str] = []
-    for raw in [s.strip() for s in ref.split("/") if s.strip()]:
+    checked_before_create = before_create is None
+    segments = [s.strip() for s in ref.split("/") if s.strip()]
+    if create_missing:
+        for raw in segments:
+            seg = redact(raw)
+            if len(seg) > _MAX_FOLDER_NAME:
+                return (
+                    "",
+                    created,
+                    f"folder name too long ({len(seg)} chars): "
+                    f"`{seg[:40]}…` — keep each path segment to "
+                    f"{_MAX_FOLDER_NAME} characters or fewer",
+                )
+    for raw in segments:
         # Redact BEFORE the lookup, not only before the write. The name is
         # agent-authored and lands in durable state the sidebar re-renders on
         # every visit, so it gets the egress pass (same reason issue-radar
@@ -1463,13 +1498,54 @@ def _walk_chat_folder_segments(
             continue
         if not create_missing:
             return "", created, None
+        if not checked_before_create and before_create is not None:
+            checked_before_create = True
+            refused = before_create(parent)
+            if refused:
+                return "", created, refused
         made = _post(
             "/api/chat/folders",
             {"name": seg, "parent_id": parent},
             session_key=session_key,
         )
+        if made.get("code") == "folder_name_exists":
+            # The endpoint refuses an agent a same-name sibling under its lock.
+            # Either a concurrent walk created this segment after our read, or
+            # the folder exists but this caller's view of the tree omits it (a
+            # crew member reads only its own folders). Re-read once: the first
+            # case resolves to the winner's folder, the second is refused
+            # rather than forked into a duplicate beside the one it cannot see.
+            fresh, fresh_err = _get_rows("/api/chat/folders")
+            if fresh_err:
+                return "", created, redact(str(fresh_err))
+            folders[:] = fresh
+            matches = _chat_folder_children(folders, parent, seg)
+            if len(matches) > 1:
+                return "", created, _ambiguous_segment_error(seg, matches)
+            if matches:
+                walked = str(matches[0].get("id") or "")
+                parent = walked
+                continue
+            return (
+                "",
+                created,
+                (
+                    f"a folder named `{seg}` already exists there and is not one "
+                    "this session can file into, so no duplicate was created — "
+                    "use a path under a folder you created, or a different name"
+                ),
+            )
         if made.get("error"):
             return "", created, str(made["error"])
+        if made.get("reused"):
+            # The endpoint handed back this caller's own same-name folder, which
+            # a concurrent walk created after our read. Nothing new exists.
+            made = {k: v for k, v in made.items() if k != "reused"}
+            if not any(str(f.get("id") or "") == str(made.get("id") or "") for f in folders):
+                folders.append(made)
+            walked = str(made.get("id") or "")
+            parent = walked
+            continue
         folders.append(made)
         created.append(str(made.get("name") or seg))
         walked = str(made.get("id") or "")
@@ -1484,7 +1560,11 @@ def _resolve_chat_folder_id(ref: str, folders: list[dict]) -> tuple[str, str | N
 
 
 def _ensure_chat_folder_path(
-    ref: str, folders: list[dict], *, session_key: str
+    ref: str,
+    folders: list[dict],
+    *,
+    session_key: str,
+    before_create: Callable[[str], str | None] | None = None,
 ) -> tuple[str, list[str], str | None]:
     """Resolve a parent-folder reference, creating missing segments (mkdir -p).
 
@@ -1492,7 +1572,9 @@ def _ensure_chat_folder_path(
     segments are real folders, and each must be created under the identity the
     caller's gate verified rather than one the write helper re-derives.
     """
-    return _resolve_chat_folder_ref(ref, folders, create_missing=True, session_key=session_key)
+    return _resolve_chat_folder_ref(
+        ref, folders, create_missing=True, session_key=session_key, before_create=before_create
+    )
 
 
 def _resolve_chat_slot_key(ref: str, slots: list[dict]) -> tuple[str, str | None]:
@@ -1871,7 +1953,9 @@ def _refuse_tree_shaping_if_unverifiable(verb: str) -> tuple[str, str, str | Non
     return caller_key, scope, None
 
 
-def _resolve_folder_for_new_session(folder_ref: str, verb: str) -> tuple[str, str, str, str | None]:
+def _resolve_folder_for_new_session(
+    folder_ref: str, verb: str, preflight: Callable[[str], str | None] | None = None
+) -> tuple[str, str, str, str | None]:
     """``(folder_id, folder_label, made_note, error)`` for filing a NEW session.
 
     Shared by ``session_create`` and ``session_fork``, which file a child the same
@@ -1888,6 +1972,14 @@ def _resolve_folder_for_new_session(folder_ref: str, verb: str) -> tuple[str, st
     itself is then refused, the same partial-report posture chat_folder_create
     takes, since folder deletion is deliberately not a capability this server
     has.
+
+    ``preflight`` closes that gap for the common case. The walk calls it just
+    before its first create, with the deepest folder that already exists, and
+    it returns an error string when the session create itself would be
+    refused. That refusal ends the walk with nothing made, so a create that
+    cannot succeed leaves no empty folder behind. Only a refusal that appears
+    between the preflight and the create (a race, or a folder-create rate limit
+    hit part-way down the path) can still strand segments.
     """
     if not folder_ref:
         return "", "", "", None
@@ -1918,7 +2010,7 @@ def _resolve_folder_for_new_session(folder_ref: str, verb: str) -> tuple[str, st
     if folders_err:
         return "", "", "", redact(f"Error: {folders_err}")
     fld_id, created_segments, fld_err = _ensure_chat_folder_path(
-        folder_ref, chat_folders, session_key=gate_key
+        folder_ref, chat_folders, session_key=gate_key, before_create=preflight
     )
     made_note = ""
     if created_segments:
@@ -1960,15 +2052,32 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
     if name == "session_create":
         args = validate_tool_args(args, SESSION_CREATE_SCHEMA)
         payload: dict[str, Any] = {"title": args.get("title", ""), "agent": args.get("agent", "")}
+        if args.get("model"):
+            payload["model"] = args["model"]
+
+        def _preflight_create(deepest_id: str) -> str | None:
+            # The same create, as a dry run, against the folder the new path
+            # segments would hang from. Its refusal is the real create's.
+            probe = {**payload, "dry_run": True}
+            if deepest_id:
+                probe["folder_id"] = deepest_id
+            checked = _post("/api/session-control/create", probe, session_key=caller_key)
+            if checked.get("error"):
+                return redact(
+                    f"Error: could not create a session: {checked['error']} "
+                    "(no folder was created)"
+                )
+            return None
+
         fld_id, folder_label, made_note, fld_err = _resolve_folder_for_new_session(
-            str(args.get("folder") or ""), "filing a new session at creation"
+            str(args.get("folder") or ""),
+            "filing a new session at creation",
+            preflight=_preflight_create,
         )
         if fld_err:
             return fld_err
         if fld_id:
             payload["folder_id"] = fld_id
-        if args.get("model"):
-            payload["model"] = args["model"]
         resp = _post(
             "/api/session-control/create",
             payload,
