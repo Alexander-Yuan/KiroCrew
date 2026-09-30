@@ -1895,6 +1895,7 @@ class TestAdvertisedSet:
             "session_broadcast",
             "session_status",
             "session_read_message",
+            "session_summary",
             "session_adopt",
             "session_release",
         }
