@@ -1980,7 +1980,6 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         "dashboard/chat_nav.py",
         "dashboard/chat_persistence.py",
         "dashboard/chat_regenerate.py",
-        "dashboard/chat_rewind.py",
         "dashboard/chat_title.py",
         "dashboard/chat_utils.py",
         "dashboard/chat_voice.py",
