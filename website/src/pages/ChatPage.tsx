@@ -5665,6 +5665,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                   bodyBeyondPreview={pinned.bodyBeyondPreview}
                   pushUp={pinned.push}
                   liveH={pinned.liveH}
+                  maxH={pinned.maxH}
                   bannerH={pinned.bannerH}
                   expanded={pinExpanded}
                   onToggleExpanded={() => setPinExpanded(p => !p)}
