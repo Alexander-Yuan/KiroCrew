@@ -42,13 +42,9 @@
     "reject": "Einmal ablehnen",
     "running": "Läuft",
     "idle": "Inaktiv",
-    "done": "Abgeschlossen",
     "blocked": "Blockiert",
-    "waiting": "Wartet",
     "needs_input": "Fragen",
-    "stopped": "Gestoppt",
     "progress": "{{done}} / {{total}} abgenommen oder abgehakt",
-    "progress_label": "Verifizierter Aufgabenfortschritt",
     "adaptive_title": "Eine veröffentlichte Ansicht für diese Aufgabe erstellen",
     "adaptive_description": "Der Agent kann hier eine aufgabenspezifische Ansicht veröffentlichen: eine Zeitleiste, ein Board, eine Abhängigkeitskarte oder eine andere hilfreiche Ansicht. Bis dahin bleiben Live-Aktivität und Anfragen verfügbar.",
     "contained": "Antworte oben unter Fragen und Genehmigungen. Die vom Agenten gestaltete Seite kann keine Aktionen genehmigen.",
@@ -63,6 +59,7 @@
     "source_views": "von Agents veröffentlichte Ansichten im „Dashboard“ einer Sitzung",
     "stale": "Einige Quellen sind nicht verfügbar. Der letzte bekannte Stand kann veraltet sein.",
     "no_input": "In dieser Kategorie wartet nichts auf dich.",
+    "options_question": "Die Sitzung wartet auf deine Auswahl.",
     "open_session": "Sitzung öffnen",
     "open_to_answer": "Diese Ansicht kann die Anfrage nicht verifizieren. Öffne die Sitzung, um sie zu prüfen und zu antworten.",
     "explicit_input": "Erst dein ausdrückliches Absenden übermittelt eine Antwort oder Genehmigung.",
@@ -12247,7 +12244,9 @@
         "decisions_runtime_running": "Läuft auf diesem Rechner.",
         "decisions_runtime_running_off": "Läuft auf diesem Rechner, bekommt aber nichts, solange der Decisions-Schalter oben aus ist.",
         "decisions_runtime_error": "Das Modell konnte nicht gestartet werden.",
-        "decisions_runtime_retry": "Erneut versuchen"
+        "decisions_runtime_retry": "Erneut versuchen",
+        "dashboard": "Dynamisches Dashboard",
+        "dashboard_desc": "Schaltet das in Entwicklung befindliche dynamische Dashboard ein: eine Statuszeile über dem Chat-Eingabefeld, eine Dashboard-Ansicht im Seitenbereich und auf der Seite eines Crewmitglieds sowie eine Seite „Alle Dashboards“. Das Layout wird noch gestaltet, daher wird es erst angezeigt, wenn du es einschaltest. Enthält auch den Schalter für automatische Karten."
       },
       "kiroSignInCard": {
         "title": "Kiro-Anmeldung",

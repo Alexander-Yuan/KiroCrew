@@ -42,13 +42,9 @@
     "reject": "Rifiuta una volta",
     "running": "In esecuzione",
     "idle": "Inattivo",
-    "done": "Completato",
     "blocked": "Bloccato",
-    "waiting": "In attesa",
     "needs_input": "Domande",
-    "stopped": "Interrotto",
     "progress": "{{done}} / {{total}} accettati o spuntati",
-    "progress_label": "Avanzamento verificato",
     "adaptive_title": "Crea una vista pubblicata per questa attività",
     "adaptive_description": "L’agente può pubblicare qui una vista adatta all’attività: cronologia, bacheca, mappa delle dipendenze o un’altra vista utile. Nel frattempo, attività in tempo reale e richieste restano disponibili.",
     "contained": "Rispondi in Domande e Approvazioni qui sopra. La pagina progettata dall’agente non può approvare azioni.",
@@ -63,6 +59,7 @@
     "source_views": "le viste pubblicate dagli agenti nella «Dashboard» di una sessione",
     "stale": "Alcune fonti non sono disponibili. L’ultimo stato noto potrebbe non essere aggiornato.",
     "no_input": "Niente in questa categoria richiede il tuo intervento.",
+    "options_question": "La sessione attende la tua scelta.",
     "open_session": "Apri sessione",
     "open_to_answer": "Questa vista non può verificare la richiesta. Apri la sessione per esaminarla e rispondere.",
     "explicit_input": "Solo il tuo invio esplicito trasmette una risposta o un’approvazione.",
@@ -12429,7 +12426,9 @@
         "decisions_runtime_running": "In esecuzione su questo computer.",
         "decisions_runtime_running_off": "È in esecuzione su questa macchina, ma non riceve nulla finché l’interruttore Decisions qui sopra è spento.",
         "decisions_runtime_error": "Impossibile avviare il modello.",
-        "decisions_runtime_retry": "Riprova"
+        "decisions_runtime_retry": "Riprova",
+        "dashboard": "Dashboard dinamica",
+        "dashboard_desc": "Attiva la dashboard dinamica, ancora in sviluppo: una riga di stato sopra il compositore della chat, una vista Dashboard nel pannello laterale e nella pagina di un membro dell’equipaggio, e una pagina Tutte le dashboard. Il layout è ancora in fase di progettazione, quindi non viene mostrata finché non la attivi. Contiene anche l’interruttore delle schede automatiche."
       },
       "kiroSignInCard": {
         "title": "Accesso a Kiro",
