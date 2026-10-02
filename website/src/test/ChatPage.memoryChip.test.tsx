@@ -147,9 +147,7 @@ describe('memory chip above the composer', () => {
 
   it('is absent once the session has messages', async () => {
     await renderWith({ messages: [{ role: 'user', content: 'hello' }, { role: 'assistant', content: 'hi' }] })
-    // The row itself stays for the Crew Mode chip (ChatPage.crewMode.test.tsx);
-    // the memory chip is what leaves.
-    expect(screen.queryByTestId('memory-mode-chip')).toBeNull()
+    expect(screen.queryByTestId('composer-memory-chip')).toBeNull()
   })
 
   it('still renders for a slot carrying the legacy orchestrator mode', async () => {

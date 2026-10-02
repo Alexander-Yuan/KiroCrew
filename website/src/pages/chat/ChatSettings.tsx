@@ -173,7 +173,6 @@ export interface DashboardConfig {
   quick_send: boolean
   session_grid: boolean
   tail_fork_enabled: boolean
-  default_crew_mode: boolean
   link_previews: boolean
   link_patterns: { pattern: string; url: string }[]
   mcp_app_panel: boolean

@@ -1,4 +1,3 @@
-import { newChatAgent } from '../../lib/crewMode'
 import { useMemo, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import type { NavigateFunction } from 'react-router-dom'
@@ -108,8 +107,7 @@ export function usePaletteActions(): PaletteActions {
   const hasActiveChat = useAppSelector((s) => s.chat.activeSlot !== null)
 
   const { mutate: doCreateSlot } = useMutation({
-    // A person's New Chat gesture: Settings may start it in Crew Mode.
-    mutationFn: () => dispatch(createSlot(newChatAgent(undefined, undefined))).unwrap(),
+    mutationFn: () => dispatch(createSlot(undefined)).unwrap(),
     onError: (err: unknown) => {
       // The palette has already closed by the time this settles, so there is no
       // surface left to render the failure on and no other record of it.
