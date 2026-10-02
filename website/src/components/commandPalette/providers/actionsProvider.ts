@@ -1,4 +1,3 @@
-import { newChatAgent } from '../../../lib/crewMode'
 import { createElement } from 'react'
 import type { ReactNode } from 'react'
 import { useMemo } from 'react'
@@ -192,8 +191,7 @@ export function useActionsProvider(opts: { openShortcuts: () => void }): Resourc
   // mutation (`use-react-query` lint rule). onSuccess navigates to /chat so the
   // user lands in the new session rather than staying on the current page.
   const { mutate: doNewSession } = useMutation({
-    // A person's New Chat gesture: Settings may start it in Crew Mode.
-    mutationFn: () => dispatch(createSlot(newChatAgent(undefined, undefined))).unwrap(),
+    mutationFn: () => dispatch(createSlot(undefined)).unwrap(),
     onSuccess: () => navigate('/chat'),
   })
 
