@@ -3732,6 +3732,15 @@ class SubagentManager:
         # durable state is still QUEUED, so without this set every store-backed
         # depth read between pop and claim counts them as waiting.
         self._dispatching_ids: set[str] = set()
+        # The same popped ids, read by ``is_queued`` (the serial-lock
+        # done-probe) while a row is in neither ``_queue`` nor ``_agents``:
+        # without it the probe reads such a row as finished and releases the
+        # guard. It is the ONLY record of a popped non-durable row; a durable
+        # one is also in the store's unstarted index. Marked with
+        # ``_dispatching_ids`` but outlives it across a retained claim, which
+        # still holds pending work until the retry registers or refuses it
+        # (``retry_retained_claims``).
+        self._dispatch_window_ids: set[str] = set()
         # Batch ids whose spawn_batch_started event has already fired.
         self._seen_batches: set[str] = set()
         # Submission accounting per wave: batch_id -> (submitted, expected).
@@ -6113,6 +6122,9 @@ class SubagentManager:
 
     def get(self, agent_id: str) -> SubagentInfo | None:
         return self._run_events.get_impl(agent_id)
+
+    def is_queued(self, agent_id: str) -> bool:
+        return self._run_events.is_queued_impl(agent_id)
 
     @property
     def count(self) -> int:

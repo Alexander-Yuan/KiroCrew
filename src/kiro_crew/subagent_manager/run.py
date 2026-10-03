@@ -425,6 +425,47 @@ class RunEventCoordinator(ManagerComponent):
         """Get agent info by ID."""
         return self._manager._agents.get(agent_id)
 
+    def is_queued_impl(self, agent_id: str) -> bool:
+        """Whether *agent_id* names a spawn accepted but not yet started.
+
+        A spawn admitted behind the concurrency / adaptive cap -- or deferred by
+        the memory or posture guard, at accept or at drain time -- returns its
+        real id to the caller but has no ``_agents`` entry until it starts. A
+        serial-lock done-probe that read such an id as finished (``_agents``
+        miss) would release the caller's guard and let a duplicate of
+        not-yet-run work be queued. Three places can hold it:
+
+        * the in-memory ``_queue`` (a params dict), while it is windowed;
+        * ``_dispatch_window_ids``, across the pump's pop-to-claim /
+          retained-claim window -- the only record of a popped row that has no
+          durable one (``incognito`` / ``temporary``, or no store at all);
+        * the durable task store, for every durable row: the store's own
+          unstarted-row index (``TaskStore.is_unstarted``), written through by
+          the same commit that moves the row, so every path that leaves a row
+          waiting on disk (the cap's store-only branch, a pressure deferral, a
+          drain-time deferral, the window eviction, a retained claim) is named,
+          and every path that ends one (settle, cancel, boundary, cancel-tree,
+          wait expiry) unnames it, with no bookkeeping of the manager's own to
+          miss a path. The index is in memory: NEVER a SQLite read here, since a
+          done-probe runs on the gateway loop.
+
+        A ``_resume_id`` entry reuses an existing ``_agents`` row, so it is not a
+        fresh queued spawn; an id-less entry has no handle; and an id with a
+        live ``_agents`` row is a run, not a queued spawn, even while its row is
+        claimable on disk (a woken wait lands in ``retry_wait``).
+        """
+        if not agent_id or agent_id in self._manager._agents:
+            return False
+        for params in self._manager._queue:
+            if params.get("_resume_id"):
+                continue
+            if params.get("_preassigned_id", "") == agent_id:
+                return True
+        if agent_id in self._manager._dispatch_window_ids:
+            return True
+        store = getattr(self._manager, "_taskq", None)
+        return store is not None and bool(store.is_unstarted(agent_id))
+
     async def _teardown_run_session_impl(self, info: SubagentInfo, session_key: str) -> None:
         """Release and reset the run's own session (skipped when reaped).
 
