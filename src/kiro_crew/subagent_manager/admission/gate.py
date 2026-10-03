@@ -1850,6 +1850,7 @@ class _GateMixin(ManagerComponent):
                 agent_id=info.id,
                 agent=info.agent,
                 model=info.model,
+                task=info.task,
                 scope={
                     "memory": info.include_memory,
                     "lessons": info.include_lessons,
