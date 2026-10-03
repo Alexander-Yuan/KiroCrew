@@ -74,6 +74,7 @@ from kiro_crew.agent_sdk.spec_hooks import (
     refuse_stale_switch,
     reproject_claimed_session,
     session_agent,
+    spec_project_dir,
 )
 from kiro_crew.agent_sdk.tool_search import resume_takes_tool_search_replay
 from kiro_crew.agent_spec_format import NATIVE_SKILL_ALIAS_PREFIX
@@ -920,7 +921,9 @@ async def _prepare_spec_hooks(
         logger.warning("no agent is known for this KAS session; tool calls are blocked")
         return [], True, work_dir
     try:
-        hooks, lost, unconfirmable = await asyncio.to_thread(crew_fired_spec_hooks, agent)
+        hooks, lost, unconfirmable = await asyncio.to_thread(
+            crew_fired_spec_hooks, agent, spec_project_dir(client)
+        )
     except Exception:  # noqa: BLE001 - the caller fails PreToolUse closed
         logger.warning(
             "agent spec hooks for %r could not be read; tool calls are blocked",
