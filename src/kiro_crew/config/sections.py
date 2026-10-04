@@ -4913,7 +4913,8 @@ class ResourceLimitsConfig:
             "cgroup MemoryMax for the whole agents SLICE -- how much every "
             "agent tree may claim together, independent of the per-scope "
             "ceiling. 0 or unset uses the host-proportional module default; "
-            "the aggregate ceiling is never left unset.",
+            "the aggregate ceiling is never left unset where a systemd user "
+            "manager is available (Linux); not enforced on Windows/macOS.",
             nullable=True,
         ),
     )
@@ -4923,7 +4924,9 @@ class ResourceLimitsConfig:
             "Max total processes",
             "cgroup TasksMax for the whole agents SLICE, counting tasks "
             "(threads) across every agent tree. 0 or unset uses the module "
-            "default; the aggregate ceiling is never left unset.",
+            "default; the aggregate ceiling is never left unset where a "
+            "systemd user manager is available (Linux); not enforced on "
+            "Windows/macOS.",
             nullable=True,
         ),
     )
