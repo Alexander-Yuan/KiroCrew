@@ -77,6 +77,12 @@ the log, while a confirmed target change (including a new port) logs immediately
 - **Agent-authored data is redacted at every browser sink.** notify/mood/
   watchlist/chat-push/pins all pass through `redact.redact_tree` (or
   `_redact_plan_tree`) before reaching the browser.
+- **Mutating routes are owner-only for dashboard subjects.** Every POST/DELETE
+  handler in `backend/routes.py` calls `_owner_denied` first: a caller with an
+  empty or missing `app` claim must pass `require_owner_dashboard_request` or
+  gets the shared 403 `owner_only`, before any body read or runtime use. An app
+  token keeps the scope `token_auth` already granted it. GET routes are not
+  owner-gated. Pinned by `test/test_mochi_owner_gate.py`.
 
 ## Deliberate divergences (do NOT "fix" in an upstream sync)
 
