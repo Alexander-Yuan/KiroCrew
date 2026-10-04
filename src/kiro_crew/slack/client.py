@@ -695,8 +695,25 @@ class RealSlackClient(SlackClientOps):
                 body["chunks"] = chunks
             resp = await self._web.api_call("chat.startStream", json=body)
             return resp.get("ts")
-        except Exception:
-            logger.warning("chat.startStream failed", exc_info=True)
+        except Exception as exc:
+            # A turn with no originating Slack user -- a subagent run, or a cron
+            # job streaming into a channel -- carries user_id="", so the body
+            # omits recipient_user_id. On an org-wide (Enterprise Grid) install
+            # Slack rejects that with ``missing_recipient_user_id`` (and the
+            # team-less variant ``missing_recipient_team_id``); on a
+            # single-workspace install the same call streams fine. The caller
+            # demotes to chat.update on the None return either way, so this known
+            # rejection is routine, not a defect: log one line without a stack
+            # trace. Anything else is unexpected and keeps the full traceback.
+            code = ""
+            try:
+                code = str(getattr(exc, "response", {}).get("error", "") or "")
+            except Exception:
+                code = ""
+            if code in ("missing_recipient_user_id", "missing_recipient_team_id"):
+                logger.warning("chat.startStream has no recipient (%s); using chat.update", code)
+            else:
+                logger.warning("chat.startStream failed", exc_info=True)
             return None
 
     async def append_stream(self, channel: str, ts: str, text: str) -> bool:
