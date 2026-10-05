@@ -155,7 +155,11 @@ from kiro_crew.security import (
     redact_local_paths,
 )
 from kiro_crew.sel import sel
-from kiro_crew.session import _CIRCUIT_BREAKER_THRESHOLD, SessionClosingError, SessionManager
+from kiro_crew.session import (
+    _CIRCUIT_BREAKER_THRESHOLD,
+    SessionClosingError,
+    SessionManager,
+)
 from kiro_crew.session_lifecycle import (
     STOP_DECLINED_COMPACTING_TEXT,
     compaction_in_flight,
@@ -2777,7 +2781,7 @@ async def _handle_compact_command(
             # another timeout, or the graceful "timed out" branch is
             # unreachable and a slow-but-healthy session gets destroyed.
             await asyncio.wait_for(provider.compact(), timeout=120)
-            cr = await provider.wait_for_compaction()
+            cr = await provider.wait_for_compaction(timeout=sessions.compact_wait_budget_secs())
             if cr["type"] == "completed":
                 # ``summary`` is model-facing compacted context, not a
                 # user-facing receipt. Never publish its orchestration text.

@@ -1076,7 +1076,12 @@ async def execute_task(
             )
             try:
                 await client.compact()
-                compact_result = await client.wait_for_compaction()
+                # The manager's budget, the one resolver every caller uses; it
+                # holds in a standalone `kirocrew run`, which arms no
+                # live-config watcher.
+                compact_result = await client.wait_for_compaction(
+                    timeout=sessions.compact_wait_budget_secs()
+                )
                 if compact_result.get("type") == "completed":
                     logger.info("Task %d: compaction succeeded", task.index)
                 else:

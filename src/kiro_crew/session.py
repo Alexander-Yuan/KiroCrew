@@ -1993,9 +1993,7 @@ class SessionManager:
                 get_recorder=lambda: get_recorder(),
                 context_pct_is_unknown=lambda provider: _context_pct_is_unknown(provider),
                 unlink_session_queue=lambda session: _unlink_session_queue(session),
-                compact_wait_timeout_secs=lambda: _resolve_compact_wait_secs(
-                    self._cfg.session.compact_wait_secs
-                ),
+                compact_wait_timeout_secs=lambda: self.compact_wait_budget_secs(),
                 compact_result_wait_secs=lambda elapsed, budget: _compact_result_wait_secs(
                     elapsed, budget
                 ),
@@ -2674,6 +2672,21 @@ class SessionManager:
             yield
         finally:
             boundary.end_ending(key)
+
+    def compact_wait_budget_secs(self) -> float:
+        """The compaction wait budget this manager's config is in force with.
+
+        The ONE resolver for ``session.compact_wait_secs``: the automatic
+        coordinator, the task runner's context-overflow compaction, the
+        dashboard ``/compact`` and every chat channel's compact command and
+        near-limit compaction all hold this manager and read the budget here,
+        so no caller can resolve the key differently. The manager's config is
+        the one the process booted with, re-adopted on every live change, so a
+        change applies to the next compaction, and a standalone
+        ``kirocrew run`` (no live-config watcher) still honours the key. Read
+        per call -- a plain attribute read, safe on the event loop.
+        """
+        return _resolve_compact_wait_secs(self._cfg.session.compact_wait_secs)
 
     def check_context_usage(self, key: str, provider: LLMProvider) -> float:
         """Delegate context accounting and compaction triggering."""
