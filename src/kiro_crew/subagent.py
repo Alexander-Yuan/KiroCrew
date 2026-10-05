@@ -3821,6 +3821,22 @@ class SubagentManager:
         # row needs none of this: the store keeps it and the claim re-checks
         # the stop.
         self._undurable_in_dispatch: dict[str, dict[str, Any]] = {}
+        # parent_session_key -> how many Stop all calls for it are in flight.
+        # While one is, the refill windows none of that parent's rows: a fetch
+        # queued before the stop would otherwise put back rows the stop is
+        # cancelling, or window store-only rows its pending read then skips.
+        self._stopping_parents: dict[str, int] = {}
+        # agent_id -> the per-row answer of the Stop all batch that is
+        # cancelling its row and has not reported it yet. A single ``cancel``
+        # of such a row joins the batch instead of cancelling and reporting it
+        # again (``cancel_impl``), and a claim whose re-read the cancel may
+        # have overtaken waits for it and re-reads (``claim_and_start``): the
+        # row is in neither ``_queue`` nor ``_agents``.
+        self._batched_stops: dict[str, asyncio.Future[Any]] = {}
+        # agent_id -> the parent of each row filed in ``_batched_stops``, for
+        # as long as it is filed: a parent-end teardown's snapshot gates the
+        # batch's report of a row that is in neither ``_queue`` nor ``_agents``.
+        self._batched_stop_parents: dict[str, str] = {}
         # Batch ids whose spawn_batch_started event has already fired.
         self._seen_batches: set[str] = set()
         # Submission accounting per wave: batch_id -> (submitted, expected).
@@ -4514,12 +4530,15 @@ class SubagentManager:
         except Exception:
             logger.debug("Failed to record slow command for %s", info.id, exc_info=True)
 
-    def _claim_finalize(self, info: SubagentInfo, *, supersede_recovery: bool = False) -> bool:
+    def _claim_finalize(
+        self, info: SubagentInfo, *, supersede_recovery: bool = False, row_settled: bool = False
+    ) -> bool:
         claimed = self._terminal._claim_finalize_impl(info, supersede_recovery=supersede_recovery)
         if claimed:
             # The one reporter of the outcome also writes it to the task store,
-            # fenced by the generation the run was dispatched under.
-            self._admission.taskq_settle(info)
+            # fenced by the generation the run was dispatched under -- unless
+            # the reporter's own store call already wrote it (``row_settled``).
+            self._admission.taskq_settle(info, row_settled=row_settled)
         return claimed
 
     async def _report_terminal(
@@ -6683,8 +6702,8 @@ class SubagentManager:
     def _unqueue(self, agent_id: str, **kwargs: Any) -> dict | None:
         return self._cancellation._unqueue_impl(agent_id, **kwargs)
 
-    def _report_queued_stop(self, params: dict) -> None:
-        return self._cancellation._report_queued_stop_impl(params)
+    def _report_queued_stop(self, params: dict, *, row_settled: bool = False) -> None:
+        return self._cancellation._report_queued_stop_impl(params, row_settled=row_settled)
 
     async def cancel(self, agent_id: str) -> bool:
         return await self._cancellation.cancel_impl(agent_id)

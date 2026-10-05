@@ -654,7 +654,9 @@ async def test_cancel_store_only_queued_row_never_starts(quiet) -> None:
     assert [p["_preassigned_id"] for p in mgr._queue] == [in_window.id]
     assert mgr._taskq.state_of(outside.id) == model.QUEUED
     reported: list[SubagentInfo] = []
-    mgr._report_queued_stop = lambda params: reported.append(params)  # type: ignore[method-assign]
+    mgr._report_queued_stop = lambda params, **_kw: reported.append(  # type: ignore[method-assign]
+        params
+    )
     assert await mgr.cancel(outside.id) is True
     assert mgr._taskq.state_of(outside.id) == model.CANCELLED
     assert reported and reported[0]["_preassigned_id"] == outside.id
@@ -1041,7 +1043,7 @@ async def test_boundary_cancel_marker_after_claim_releases_and_stops_row(
     params = mgr._queue.pop(0)
     mgr._running_count = 0
 
-    def _record_terminal(_params: dict) -> None:
+    def _record_terminal(_params: dict, **_kw: object) -> None:
         mgr._agents[waiting.id] = SubagentInfo(
             id=waiting.id,
             task=waiting.task,
@@ -1260,7 +1262,9 @@ async def test_a_row_registered_during_stop_alls_read_is_reaped_not_replaced(
     all reaps it as one: its ``_agents`` record is the run's own, never a
     queued-stop record laid over it, and its store row is not cancelled out
     from under the run. The run's ``admitted -> starting`` mark is held, which
-    is the moment a registered run's row is still ``admitted``.
+    is the moment a registered run's row is still ``admitted``. The pass's
+    writer-thread cancel job never names the run's row: the running sweep's
+    reap is its only stop.
     """
     mgr, params = await _popped_row(monkeypatch)
     store: TaskStore = mgr._taskq
@@ -1268,6 +1272,14 @@ async def test_a_row_registered_during_stop_alls_read_is_reaped_not_replaced(
     real_run = store.run
     real_post = store.post
     listed, release_stop = asyncio.Event(), asyncio.Event()
+    batched: list[str] = []
+    real_batch = SpawnAdmissionCoordinator.taskq_post_cancel_queued
+
+    def _record_batch(self: Any, ids: Any) -> Any:
+        batched.extend(ids)
+        return real_batch(self, ids)
+
+    monkeypatch.setattr(SpawnAdmissionCoordinator, "taskq_post_cancel_queued", _record_batch)
     held_marks: list[tuple[Any, tuple, dict, asyncio.Future]] = []
 
     async def _gated(fn, /, *args, **kwargs):
@@ -1308,12 +1320,122 @@ async def test_a_row_registered_during_stop_alls_read_is_reaped_not_replaced(
         await settle_store_writes(store, rounds=4)
 
         assert stopped == (1, 0), "a registered run is stopped as the running run it is"
+        assert agent_id not in batched, "the queued pass's cancel job left the run's row out"
         assert mgr._agents[agent_id] is started
         assert started.reaped and started.user_stopped and not started.queued
         assert agent_id not in mgr._tasks
         assert store.state_of(agent_id) == model.CANCELLED
     finally:
         await _land_held_marks()
+        await mgr.cancel_all()
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+@pytest.mark.parametrize("claim_joins", [True, False], ids=["claim_joins", "start_unjoined"])
+async def test_a_claim_resumed_between_stop_alls_post_and_answer_refuses_the_start(
+    quiet, monkeypatch: pytest.MonkeyPatch, claim_joins: bool
+) -> None:
+    """The pump's post-claim re-read is queued ahead of Stop all's batched
+    cancel, so it answers "still current"; the claimer resumes after the job
+    is posted and before its answer comes back, when no queued-stop record
+    exists yet. Explicit barriers, no sleeps: the re-read's answer is held
+    until the job is posted, and the job's answer until the claimer has
+    either looked up the batch's answer for its row or registered.
+
+    * ``claim_joins``: the claimer waits for the batch's answer and re-reads
+      behind the cancel, so it refuses the start. The row is stopped once,
+      as the queued row it was: ``(0, 1)``, as on main, where the synchronous
+      cancel installed the record before the claimer resumed.
+    * ``start_unjoined``: a start that does not join (the join disabled)
+      registers the run before the answer. The batch neither counts nor
+      reports that row; the running sweep reaps and counts it: ``(1, 0)``.
+
+    Before the claimer joined, it registered the run, the cancel ended it
+    under the run, and Stop all counted the one agent twice: ``(1, 1)``.
+    """
+    mgr, params = await _popped_row(monkeypatch)
+    store: TaskStore = mgr._taskq
+    agent_id = params["_preassigned_id"]
+    real_run = store.run
+    taskq_revalidate = mgr._admission.taskq_claim_still_current
+    if not claim_joins:
+        monkeypatch.setattr(
+            SpawnAdmissionCoordinator, "_batched_stop_of", lambda _self, _id: None, raising=False
+        )
+    reread, posted, looked = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    release_answer = asyncio.Event()
+    rereads: list[tuple] = []
+    batched: list[str] = []
+    real_batch = SpawnAdmissionCoordinator.taskq_post_cancel_queued
+
+    def _hold_answer(self: Any, ids: Any) -> Any:
+        job = real_batch(self, ids)
+        batched.extend(ids)
+        posted.set()
+
+        async def _answer_later() -> Any:
+            answer = await job
+            await release_answer.wait()
+            return answer
+
+        return asyncio.ensure_future(_answer_later())
+
+    monkeypatch.setattr(SpawnAdmissionCoordinator, "taskq_post_cancel_queued", _hold_answer)
+
+    class _WatchedJoins(dict):
+        def get(self, key: Any, default: Any = None) -> Any:
+            found = super().get(key, default)
+            if key == agent_id and found is not None:
+                looked.set()
+            return found
+
+    mgr._batched_stops = _WatchedJoins()
+
+    async def _gated(fn, /, *args, **kwargs):
+        result = await real_run(fn, *args, **kwargs)
+        if fn == taskq_revalidate:
+            rereads.append(args)
+            if len(rereads) == 1:
+                reread.set()
+                await posted.wait()
+        return result
+
+    try:
+        with (
+            patch.object(store, "run", side_effect=_gated),
+            patch.object(SubagentManager, "_run", new=_park_run),
+        ):
+            dispatch = asyncio.create_task(mgr._admission._dispatch_async_impl(params))
+            await asyncio.wait_for(reread.wait(), 10)
+            assert store.state_of(agent_id) == model.ADMITTED
+            stop = asyncio.create_task(mgr.cancel_for_parent(_STOP_PARENT))
+            await asyncio.wait_for(posted.wait(), 10)
+            assert agent_id in batched
+            watch = asyncio.ensure_future(looked.wait())
+            await asyncio.wait({dispatch, watch}, timeout=10, return_when=asyncio.FIRST_COMPLETED)
+            watch.cancel()
+            assert dispatch.done() or looked.is_set()
+            release_answer.set()
+            stopped = await asyncio.wait_for(stop, 10)
+            result = await asyncio.wait_for(dispatch, 10)
+        await settle_store_writes(store, rounds=4)
+
+        assert store.state_of(agent_id) == model.CANCELLED
+        assert agent_id not in mgr._tasks
+        assert mgr._running_count == 0 and mgr._startup_reservations == 0
+        if claim_joins:
+            assert stopped == (0, 1), "stopped once, as the queued row it was"
+            assert len(rereads) == 2, "the start was decided by a re-read behind the cancel"
+            assert result is not None and result.done and result.user_stopped
+            terminal = mgr._agents[agent_id]
+            assert terminal.queued and terminal.user_stopped
+        else:
+            assert stopped == (1, 0), "a registered run is stopped as the running run it is"
+            assert result is not None and mgr._agents[agent_id] is result
+            assert result.reaped and result.user_stopped and not result.queued
+    finally:
+        release_answer.set()
         await mgr.cancel_all()
 
 
