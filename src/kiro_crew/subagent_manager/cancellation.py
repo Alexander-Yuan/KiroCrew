@@ -387,10 +387,24 @@ class CancellationCoordinator(ManagerComponent):
             agent_id,
         )
 
-    def _report_queued_stop_impl(self, params: dict, *, row_settled: bool = False) -> None:
-        """Publish a neutral terminal record for work stopped before startup.
+    def _report_queued_stop_impl(
+        self,
+        params: dict,
+        *,
+        row_settled: bool = False,
+        error: str = "",
+        report_owed: bool = False,
+    ) -> "asyncio.Task[bool] | None":
+        """Publish the terminal record of work that ended before startup.
 
-        Every stop of a waiting row ends here, whichever path removed it, so
+        A neutral stop by default. With *error* it is the failure that ended the
+        wait instead -- the memory wait's max-wait expiry
+        (``taskq_expire_memory_waits``) -- reported through the same synthetic
+        record, so batch accounting and delivery are the stop's. *report_owed*
+        marks that record as one whose report the store owes until it reaches
+        the parent (``SubagentInfo._report_owed``).
+
+        Every end of a waiting row lands here, whichever path removed it, so
         this is where the parent's queued depth is asked for -- once per row,
         each under its own wave; a bulk stop's requests share one read -- and
         the terminal record itself asks for nothing (``queued=True``).
@@ -403,9 +417,12 @@ class CancellationCoordinator(ManagerComponent):
         record was reported by whichever stop reached it first, and this one
         reports nothing. Each call builds a fresh ``SubagentInfo``, so the
         record's own one-shot claim cannot see an earlier report of the row.
+
+        Returns the report task, or None when no report runs here (no id, the
+        row already reported, or the finalize claim is already another path's).
         """
         if self._queued_stop_reported(str(params.get("_preassigned_id") or "")):
-            return
+            return None
         self._republish_queue_depth(
             str(params.get("parent_session_key") or ""), str(params.get("batch_id") or "")
         )
@@ -415,13 +432,14 @@ class CancellationCoordinator(ManagerComponent):
             parent_session_key=str(params.get("parent_session_key") or ""),
             _stage_boundary_owner=str(params.get("_stage_boundary_owner") or ""),
             agent=str(params.get("agent") or ""),
-            user_stopped=True,
+            user_stopped=not error,
+            error=error,
             queued=True,
             batch_id=str(params.get("batch_id") or ""),
             batch_total=max(0, int(params.get("batch_total") or 0)),
         )
         if not info.id:
-            return
+            return None
         # Never over a REGISTERED run's record. A row the pump claimed and
         # registered while its stop was still on the way is a live run: a
         # synthetic ``queued=True`` terminal laid over it leaves the run
@@ -433,7 +451,8 @@ class CancellationCoordinator(ManagerComponent):
                 "Queued stop for %s skipped: the run is registered; the live stop owns it",
                 info.id,
             )
-            return
+            return None
+        info._report_owed = report_owed
         # Not registered, so the row will never start: drop what this process
         # kept for its start. A registered run's holds stay with its own start.
         self._manager._forget_pending_start(info.id)
@@ -445,11 +464,15 @@ class CancellationCoordinator(ManagerComponent):
         self._manager._agents[info.id] = info
         if not self._manager._claim_finalize(info, row_settled=row_settled):
             self._manager._agents.pop(info.id, None)
-            return
-        self._manager._spawn_terminal_report(
+            return None
+        return self._manager._spawn_terminal_report(
             info,
-            source="Queued stop",
-            injection_timeout_reason="delivery timed out after queued subagent stop",
+            source="Queued expiry" if error else "Queued stop",
+            injection_timeout_reason=(
+                "delivery timed out after queued subagent expiry"
+                if error
+                else "delivery timed out after queued subagent stop"
+            ),
             mark_delivered_on_success=False,
             settle_digest=True,
         )
@@ -616,8 +639,13 @@ class CancellationCoordinator(ManagerComponent):
         parent_session_key: str,
         verb: str = "",
         accepted_since: AbstractSet[str] | None = None,
+        retry: bool = False,
     ) -> int:
         """Stop exactly the runs in *agent_ids*, reporting none of them home.
+
+        *retry* marks the reaper's re-run of a store sweep whose read was
+        refused (:meth:`retry_owed_teardown_sweeps_impl`); it only quiets the
+        refusal's log line.
 
         The cancellation half. It takes IDS rather than a parent key so that what
         is stopped was decided by :meth:`snapshot_teardown_children_impl` at a
@@ -717,11 +745,18 @@ class CancellationCoordinator(ManagerComponent):
                     parent_session_key, include_window=True
                 )
             except Exception:
-                logger.warning(
-                    "Teardown: reading the store rows of %s failed",
+                # Left queued, those rows would start into whatever the key serves
+                # next, or expire into the conversation that ended. So the fence
+                # stays open (an expiry it does not record injects nothing) and
+                # each reaper sweep retries the read until it lands.
+                # One warning per teardown; the reaper's retries log at debug.
+                log = logger.debug if retry else logger.warning
+                log(
+                    "Teardown: reading the store rows of %s failed; the reaper retries it",
                     parent_session_key,
                     exc_info=True,
                 )
+                self._owe_teardown_sweep(parent_session_key, accepted_since, verb)
                 return
             # The fence is read under its lock, after the store read: a row a
             # successor queued before that read was recorded before it was written.
@@ -962,11 +997,55 @@ class CancellationCoordinator(ManagerComponent):
                 self._manager._teardown_store_sweeps.append((parent_session_key, fence))
         return fence
 
-    def release_teardown_snapshot(self, fence: set[str] | None) -> None:
-        """Stop recording into *fence*: its cancel has swept, or never will."""
+    def _owe_teardown_sweep(
+        self, parent_session_key: str, fence: AbstractSet[str], verb: str
+    ) -> None:
+        """Keep *fence* open for a retry of its store sweep (a refused read)."""
+        with self._manager._teardown_fence_lock:
+            owed = self._manager._teardown_sweeps_owed
+            if not any(held is fence for _key, held, _verb in owed):
+                owed.append((parent_session_key, fence, verb))
+
+    async def retry_owed_teardown_sweeps_impl(self) -> int:
+        """Run again each teardown store sweep whose read the store refused.
+
+        Called from every reaper sweep. Each owed sweep is taken off the list and
+        run as the teardown's own cancel with no snapshot ids, under the fence it
+        kept open, so it stops the retired conversation's rows and spares a
+        successor's exactly as the first read would have. A read refused again
+        puts it back for the next sweep; one that lands releases the fence.
+        Returns the rows stopped.
+        """
+        with self._manager._teardown_fence_lock:
+            owed = list(self._manager._teardown_sweeps_owed)
+            self._manager._teardown_sweeps_owed.clear()
+        stopped = 0
+        for parent_session_key, fence, verb in owed:
+            try:
+                stopped += await self.cancel_for_teardown_impl(
+                    (),
+                    parent_session_key=parent_session_key,
+                    verb=verb,
+                    accepted_since=fence,
+                    retry=True,
+                )
+            finally:
+                self.release_teardown_snapshot(fence)
+        return stopped
+
+    def release_teardown_snapshot(self, fence: AbstractSet[str] | None) -> None:
+        """Stop recording into *fence*: its cancel has swept, or never will.
+
+        Not while its store sweep is owed (:meth:`_owe_teardown_sweep`): the
+        retry still needs the record, and an expiry of a retired row is gated
+        by it until then.
+        """
         if fence is None:
             return
         with self._manager._teardown_fence_lock:
+            owed = getattr(self._manager, "_teardown_sweeps_owed", ())
+            if any(held is fence for _key, held, _verb in owed):
+                return
             self._manager._teardown_store_sweeps[:] = [
                 held for held in self._manager._teardown_store_sweeps if held[1] is not fence
             ]
@@ -985,6 +1064,30 @@ class CancellationCoordinator(ManagerComponent):
             for key, held in self._manager._teardown_store_sweeps:
                 if key == parent_session_key:
                     held.add(agent_id)
+
+    def accepted_before_open_teardown(self, parent_session_key: str, agent_id: str) -> bool:
+        """True while a teardown of *parent_session_key* is open and *agent_id*
+        is not in its fence: the row was accepted for the conversation that ended.
+
+        Open from the snapshot (:meth:`note_teardown_snapshot`) until its cancel
+        has swept the store (:meth:`release_teardown_snapshot`). Read by a path
+        that ends a store row in that window (the memory wait's max-wait
+        expiry), which must not inject into the retired conversation: the
+        injector creates a session when none is live. Once the sweep is done,
+        such a row has been stopped by it.
+        """
+        if not parent_session_key or not agent_id:
+            return False
+        with self._manager._teardown_fence_lock:
+            fences = [
+                held
+                for key, held in self._manager._teardown_store_sweeps
+                if key == parent_session_key
+            ]
+            pending = self._manager._teardown_store_fences.get(parent_session_key)
+            if pending is not None:
+                fences.append(pending)
+            return any(agent_id not in fence for fence in fences)
 
     def _republish_queue_depth(self, parent_session_key: str, batch_id: str = "") -> None:
         """Re-publish *parent_session_key*'s queued depth after a stop.
