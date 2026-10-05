@@ -5458,6 +5458,41 @@ class GatewayOrchestrator:
                                 job.created_by or self._owner_id, job.name
                             )
                         if channel:
+                            # ── Extract embedded local images and upload them
+                            # natively (mirror the chat renderer's on_done seal).
+                            # The cron delivery path posts text only; without
+                            # this an inline ![alt](/abs/path.png) in the reply
+                            # ships as literal Markdown and Slack shows nothing.
+                            # within_root is the cron session's resolved cwd
+                            # (client.cwd — the agent's workspace), which bounds
+                            # extraction to files the session may read.
+                            # extract_outbound_with_audit is the SAME admission
+                            # seal the renderer uses: it writes the mandatory SEL
+                            # record for both admitted and refused files and folds
+                            # any refusal note into the text, so a cron's file
+                            # egress leaves the same audit trail as a chat reply.
+                            #
+                            # ``_cron_body`` is a SEPARATE Slack-only local: the
+                            # extraction strips the local path and may fold in a
+                            # refusal note, neither of which belongs in the value
+                            # the callback RETURNS. That return value is the job's
+                            # stored result and feeds the next run's "[Previous
+                            # run result]" prompt, so ``result_text`` is left
+                            # untouched and only the delivered body is rewritten.
+                            _cron_upload_files: list = []
+                            _cron_root = getattr(client, "cwd", "") or ""
+                            _cron_body = result_text
+                            if _cron_root:
+                                from kiro_crew.slack.files import (
+                                    extract_outbound_with_audit,
+                                )
+
+                                _cron_body, _cron_files, _ = await extract_outbound_with_audit(
+                                    result_text,
+                                    within_root=_cron_root,
+                                    audit_caller=session_key or channel or "cron",
+                                )
+                                _cron_upload_files = list(_cron_files)
                             # The caption is redacted-but-not-converted by
                             # render_for_slack's header= seam, which also charges
                             # it against the limit. Doing it there rather than
@@ -5466,7 +5501,7 @@ class GatewayOrchestrator:
                             # hand-rolled version of this had already forgotten to
                             # redact it once.
                             parts = render_for_slack(
-                                result_text,
+                                _cron_body,
                                 limit=_CRON_MSG_LIMIT,
                                 header=f"⏰ *Cron: {job.name}*\n\n",
                             )
@@ -5519,6 +5554,23 @@ class GatewayOrchestrator:
                             # Overflow parts as threaded follow-up messages
                             for part in parts[1:]:
                                 await self.slack.post_message(channel, part, thread_root)
+                            # Upload any extracted local images natively into the
+                            # same thread (bytes travel, not the path — every gate
+                            # in outbound_files was already applied). The reporting
+                            # variant posts a redacted note into the thread for any
+                            # upload Slack refuses, so a failed upload is never a
+                            # silent loss (the image markup is already stripped).
+                            if _cron_upload_files:
+                                from kiro_crew.slack.files import (
+                                    upload_outbound_files_reporting,
+                                )
+
+                                await upload_outbound_files_reporting(
+                                    self.slack,
+                                    channel,
+                                    thread_root or "",
+                                    _cron_upload_files,
+                                )
                             # Dedup state: only advance after confirmed delivery.
                             self._record_cron_delivery(job, rh)
                         else:
