@@ -10164,7 +10164,8 @@ class GatewayOrchestrator:
             event = LLMEvent(kind="permission_request", request_id=request_id, title=description)
             return await _approve_spawn_gate(event, parent_session_key)
 
-        # Debounced slots push: keep slots[].subagents_running live for every
+        # Debounced slots push: keep slots[].subagents_running and
+        # slots[].subagents_queued live for every
         # SSE consumer (composer busy affordance, Board "working" lane, and
         # external readers of the slots stream). Without this, the field is
         # only fresh on a full GET — serialize_slots() computes it at call
@@ -10187,6 +10188,27 @@ class GatewayOrchestrator:
             _slots_push_pending = True
             asyncio.get_running_loop().call_later(0.2, _flush_slots_push)
 
+        def _tab_queued_depth(parent_key: str, slot_name: str, extra: dict) -> object:
+            """The queued depth a ``subagent_queued`` frame carries: its tab's sum.
+
+            Several parents can route to one tab (a cron tab's ``cron:<job>:<run>``
+            and ``cron:<job>:<agent>`` runs). The client reducer sets the tab's
+            count from each frame, and the slot list sums the published depths by
+            tab, so a frame carrying only its own parent's depth would disagree
+            with the next slots push and the count would flip between the two.
+            The frame therefore carries this parent's depth plus every other
+            parent's published depth on the same tab. A non-int depth is passed
+            through unchanged for the client to ignore.
+            """
+            own = extra.get("queued")
+            if not isinstance(own, int) or isinstance(own, bool) or not self.subagent_mgr:
+                return own
+            total = max(own, 0)
+            for other, depth in self.subagent_mgr.published_queued_depths().items():
+                if other != parent_key and _event_slot(other) == slot_name:
+                    total += depth
+            return total
+
         async def _subagent_event(etype: str, info: SubagentInfo, extra: dict) -> None:
             if not self.dashboard_state:
                 return
@@ -10198,6 +10220,11 @@ class GatewayOrchestrator:
             _ebid = getattr(info, "batch_id", "")
             if isinstance(_ebid, str) and _ebid:
                 base["batch_id"] = _ebid
+            if etype == "subagent_queued":
+                extra = {
+                    **extra,
+                    "queued": _tab_queued_depth(info.parent_session_key, slot_name, extra),
+                }
             if etype == "subagent_injection_failed":
                 # Show error in UI + queue for LLM context on next turn.
                 slot = self.dashboard_state.get_slot(slot_name)
@@ -10257,9 +10284,11 @@ class GatewayOrchestrator:
                 if self._subagent_coalescer().handle(etype, {**base, **extra}):
                     return
                 self.dashboard_state.broadcast_ws(etype, {**base, **extra})
-                # subagents_running flips truth value exactly at spawn/done —
-                # push (debounced) so slots-stream consumers stay live.
-                if etype in ("subagent_spawn", "subagent_done"):
+                # subagents_running flips truth value exactly at spawn/done, and
+                # subagents_queued changes with every queued-depth frame — push
+                # (debounced) so slots-stream consumers stay live, and a client
+                # that missed a depth frame is corrected by the next push.
+                if etype in ("subagent_spawn", "subagent_done", "subagent_queued"):
                     _schedule_slots_push()
 
         async def _orphan_notify(parent_session: str, msg: str, meta: dict | None = None) -> bool:
