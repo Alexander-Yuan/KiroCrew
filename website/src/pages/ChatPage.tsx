@@ -6470,6 +6470,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               onOpenChange={setProjectPickerOpen}
               anchorRect={projectBtnRect}
               onSelect={path => { setProject(path); setProjectPickerOpen(false) }}
+              startPath={_slotProject}
               errorHandoff
             />
             {/* App-contributed session control popover — triggered from input bar.
