@@ -77,6 +77,7 @@ from kiro_crew.dashboard.crash_dump_store import (  # noqa: F401
     dump_replay_lines,
     newest_dump_with_stacks,
     open_dump_file,
+    record_healthy_boot,
     rotate_dumps,
     sweep_stale_dumps,
 )
@@ -1504,6 +1505,24 @@ _OWN_HOST_WARM_TASKS: "set[asyncio.Future[None]]" = set()
 _SKILL_APPROVAL_SETTING_URL = "/settings/skills?highlight=key:skills.approval_required"
 
 
+def _dispatch_healthy_boot_marker(state: DashboardState) -> None:
+    """Write the healthy-boot marker without holding readiness behind it.
+
+    Dispatched rather than awaited. The data home can be on network storage,
+    and this coroutine's RETURN is what publishes ``KIROCREW_READY``, so
+    awaiting the write would let a stalled mount hold readiness open forever
+    -- and a supervisor waiting on that line respawns straight into the same
+    hang. Everything the marker is for belongs to the NEXT boot, so nothing
+    here needs it to have landed.
+
+    Tracked in ``state._background_tasks`` so the task is not collected
+    mid-write and shutdown can see it.
+    """
+    task = asyncio.create_task(asyncio.to_thread(record_healthy_boot), name="healthy-boot-marker")
+    state._background_tasks.add(task)
+    task.add_done_callback(state._background_tasks.discard)
+
+
 async def start_dashboard(
     sessions: SessionManager,
     crons: CronService,
@@ -2274,6 +2293,9 @@ async def start_dashboard(
         state.memory_startup_task = schedule_memory_preparation()
     state.ready = True
     record_boot_to_ready((time.time() - state.start_time) * 1000.0, server="dashboard")
+    # Tells the NEXT boot that this instance got the whole startup battery
+    # away, so a stall from here on does not implicate the battery.
+    _dispatch_healthy_boot_marker(state)
 
     return runner, state
 
@@ -2638,6 +2660,9 @@ async def start_api_server(
         state.memory_startup_task = schedule_memory_preparation()
     state.ready = True
     record_boot_to_ready((time.time() - state.start_time) * 1000.0, server="api")
+    # Tells the NEXT boot that this instance got the whole startup battery
+    # away, so a stall from here on does not implicate the battery.
+    _dispatch_healthy_boot_marker(state)
 
     return runner, state
 
