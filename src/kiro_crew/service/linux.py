@@ -1878,6 +1878,58 @@ def is_up() -> bool:
     return any((s := _unit_state(user=user)).up and s.ours for user in (False, True))
 
 
+@dataclass(frozen=True)
+class AliasHolder:
+    """A scope whose ``kirocrew.service`` name resolves to a DIFFERENT unit.
+
+    ``scope`` is ``system`` or ``user``; ``unit_id`` is the canonical ``Id`` the
+    manager resolved our name to — the unit an operator pointed at our name with
+    ``Alias=kirocrew.service`` in their own unit's ``[Install]`` section, or a
+    ``kirocrew.service -> other.service`` symlink in a unit directory.
+    """
+
+    scope: str
+    unit_id: str
+
+
+def alias_holder() -> AliasHolder | None:
+    """Return the scope that holds ``kirocrew.service`` as an alias of another
+    unit, or ``None`` when no scope does.
+
+    The question :func:`is_active` / :func:`is_up` / :func:`stop` / :func:`restart`
+    cannot answer and callers that fall back from them need: those predicates
+    fail CLOSED on an alias (:attr:`_UnitState.ours` is False, so the unit is
+    never selected or counted), which is correct for "do not act on it" but
+    leaves a caller unable to tell "no managed unit here" apart from "the name is
+    an alias of a unit a manager supervises". ``kirocrew stop`` / ``kirocrew
+    restart`` ask this before their foreground-gateway fallback so they refuse —
+    exit 1, nothing signalled, nothing spawned — rather than SIGTERM the alias
+    target's process (which its manager restarts at once) and spawn a competitor
+    for the port and the ``KIROCREW_HOME`` lock. :func:`uninstall` already refuses
+    an alias whole and :func:`status` already names it; this is the same fact
+    offered to the two verbs that fall through to signalling.
+
+    System scope is checked first — the same order :func:`status` and
+    :func:`uninstall` report in — and the first scope that is an alias is
+    returned, since a refusal needs only one holder to name. ``show`` needs no
+    sudo, so both scopes use the unprivileged path.
+
+    An alias whose target is stopped (:attr:`_UnitState.running` is False —
+    ``ActiveState`` is ``inactive`` or ``failed``) is NOT reported: there is no
+    process the alias's manager is supervising, so the caller's SIGTERM would not
+    land on another unit's process, and refusing would misdirect — the printed
+    ``systemctl`` remedy points at a unit that is already down while the real
+    foreground gateway the operator means to stop keeps running. ``running``
+    fails CLOSED on an indeterminate ``ActiveState`` (empty, or a value a newer
+    systemd adds), so an alias we cannot confirm is stopped still refuses.
+    """
+    for user in (False, True):
+        state = _unit_state(user=user)
+        if state.is_alias and state.running:
+            return AliasHolder(state.scope, state.unit_id)
+    return None
+
+
 def stop() -> None:
     """Stop the service in every scope where it runs, without disabling it."""
     for user in _running_scopes():
