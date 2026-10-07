@@ -174,10 +174,12 @@ from kiro_crew.dashboard.chat_turn.directives import (  # noqa: F401
 from kiro_crew.dashboard.chat_turn.file_changes import (  # noqa: F401
     _PATH_TRUNCATION_MARKER,
     _apply_turn_snapshot_budget,
+    _classify_str_replace_before,
     _line_change_input,
     _note_reply_row,
-    _reconstruct_str_replace_before,
+    _pending_str_replace_payload,
     _record_turn_snapshot,
+    _resolve_pending_str_replace,
     _safe_read_snapshot,
     _Snapshot,
     _snapshot_write_target,
@@ -1959,16 +1961,32 @@ def _cap_redacted(text: str, limit: int, marker: str) -> tuple[str, bool]:
 
 
 def _flush_file_changes(
-    slot: "_ChatSlot", turn_boundary: int = 0, turn_start_mid: str | None = None
+    slot: "_ChatSlot",
+    turn_boundary: int = 0,
+    turn_start_mid: str | None = None,
+    turn_had_shell: bool = False,
 ) -> None:
     """Attach accumulated file changes to this turn's last assistant message.
 
-    Dedups by path (first before, last after), reads the AFTER content from
-    disk, and writes the list to message meta as ``file_changes``. Files the
-    turn budget dropped are counted in ``file_changes_omitted_files``, a plain
-    int present only when it is non-zero. Called on
-    every exit path (success / cancel / error) so users always see what was
-    modified, even on aborted turns.
+    Dedups by canonical path (first before, last after), reads the AFTER content
+    from disk, and settles a ``pending_str_replace`` snapshot against that
+    turn-end after-content by content ALONE — only the pre-write hypothesis is
+    resolvable, so a settled before is always content captured from disk at
+    snapshot time, never a value synthesised from the turn-end state. A pending
+    snapshot is settled only when the turn-end state is attributable to a single
+    tracked write: ``_record_turn_snapshot`` drops the pending hypothesis when a
+    second (or unknown) WRITE TOOL touches the same canonical path, and
+    ``turn_had_shell`` drops ALL pending resolution for the turn when a shell
+    tool ran — a shell command is opaque, can write any path, and never passes
+    through ``_record_turn_snapshot``, so a post-write snapshot followed by a
+    shell edit could otherwise leave the resolver settling an intermediate state
+    as the before. Both cases fall back to the fragment rather than a wrong
+    before (see ``_resolve_pending_str_replace`` for the resolution rule and
+    ``_record_turn_snapshot`` for the write-tool gate). Writes the list
+    to message meta as ``file_changes``. Files the turn budget dropped are
+    counted in ``file_changes_omitted_files``, a plain int present only when it
+    is non-zero. Called on every exit path (success / cancel / error) so users
+    always see what was modified, even on aborted turns.
 
     Only rows appended by this turn are scanned (see ``_turn_rows`` for the
     two ways the turn's start is identified), so a turn that changed files but
@@ -1992,30 +2010,53 @@ def _flush_file_changes(
     # Dedup: keep first before for each path (truest "before") since a file
     # may be modified multiple times in one turn.
     deduped: dict[str, dict[str, Any]] = {}
+    pending_by_path: dict[str, dict[str, Any]] = {}
     for write_order, fc in enumerate(slot._file_changes):
         p = fc["path"]
-        if p not in deduped:
-            deduped[p] = {
+        # ``/tmp/f`` and ``/tmp/./f`` share one bucket: the key is the canonical
+        # path ``_snapshot_write_target`` computes off the event loop at snapshot
+        # time, so this loop resolves no path itself. One bucket keeps the first
+        # before for a file written under two spellings.
+        key = fc.get("canonical_path") or p
+        if key not in deduped:
+            deduped[key] = {
                 "path": p,
                 "before": fc["content"],
                 "after": "",
                 "_before_truncated": bool(fc.get("truncated", False)),
             }
+            if fc.get("pending_str_replace"):
+                pending_by_path[key] = fc["pending_str_replace"]
         # The accumulator moves a path's first snapshot to the tail on every
         # write, so its position carries last-write recency without extra rows.
         # Assigning on every occurrence also supports directly supplied repeats.
-        deduped[p]["_last_write"] = write_order
+        deduped[key]["_last_write"] = write_order
     # Read after-content once per path. Uses _safe_read_snapshot so sensitive
     # paths and unreadable files yield empty after rather than crashing or
     # leaking credentials.
-    for entry in deduped.values():
+    for key, entry in deduped.items():
+        before_truncated = entry.pop("_before_truncated")
         after = _safe_read_snapshot(entry["path"])
-        if after is None:
-            entry["after"] = ""
-            after = _Snapshot("", False)
-        else:
-            entry["after"] = after.content
-        if entry.pop("_before_truncated") or after.truncated:
+        entry["after"] = after.content if after is not None else ""
+        pending = pending_by_path.get(key)
+        # Resolve a deferred strReplace against the turn-end content. The
+        # resolver settles only the pre-write hypothesis, so a resolved before
+        # is always the content captured from disk at snapshot time. The
+        # pending payload is present here only when a single known write tool
+        # touched the path this turn — _record_turn_snapshot already dropped it
+        # if a second or unknown WRITE TOOL did. A shell tool is opaque and
+        # never recorded there, so a shell write after a post-write snapshot
+        # could shape the turn-end read into a false pre-write match: when a
+        # shell ran this turn (turn_had_shell), skip resolution entirely and
+        # keep the fragment rather than trust an unattributable turn-end state.
+        if pending is not None and after is not None and not turn_had_shell:
+            resolved = _resolve_pending_str_replace(pending, after.content)
+            if resolved is not None:
+                # Already _MAX_SNAPSHOT-capped by _pending_str_replace_payload;
+                # re-truncating would append a second marker.
+                entry["before"] = resolved.content
+                before_truncated = resolved.truncated
+        if before_truncated or (after is not None and after.truncated):
             entry.update(truncated=True, snapshot_limit_chars=_MAX_SNAPSHOT)
     # Scrub exfil URLs and credentials from path/before/after BEFORE attaching
     # to message meta. _save_slot_to_history runs _redact_meta on persist, but
@@ -11975,7 +12016,11 @@ async def _run_chat(
                     diff_path=event.diff_path,
                 )
                 if _file_snapshot:
-                    _record_turn_snapshot(slot, _file_snapshot)
+                    _record_turn_snapshot(
+                        slot,
+                        _file_snapshot,
+                        _tcid_identity_key(getattr(event, "tool_call_id", None)),
+                    )
                 state.broadcast_ws(
                     "tool_call",
                     _tool_payload,
@@ -12196,7 +12241,11 @@ async def _run_chat(
                         diff_path=event.diff_path,
                     )
                     if _file_snapshot_upd:
-                        _record_turn_snapshot(slot, _file_snapshot_upd)
+                        _record_turn_snapshot(
+                            slot,
+                            _file_snapshot_upd,
+                            _tcid_identity_key(getattr(event, "tool_call_id", None)),
+                        )
                     # Refresh the toolLog entry (sseToolActivity merges by id).
                     state.broadcast_ws(
                         "tool_call",
@@ -16769,7 +16818,10 @@ async def _run_chat(
                 slot._carried_ttft_clock = None
             # Attach accumulated file changes to this turn's assistant row before persist
             _flush_file_changes(
-                slot, turn_boundary=_turn_msg_boundary, turn_start_mid=_turn_start_mid
+                slot,
+                turn_boundary=_turn_msg_boundary,
+                turn_start_mid=_turn_start_mid,
+                turn_had_shell=bool(_shell_tool_calls),
             )
             # The reply is in the window, so this save is the durable clear of
             # the in-flight marker: retire it first and the omission rides the
@@ -18835,7 +18887,10 @@ async def _run_chat(
         # bug this fix prevents.
         try:
             _flush_file_changes(
-                slot, turn_boundary=_turn_msg_boundary, turn_start_mid=_turn_start_mid
+                slot,
+                turn_boundary=_turn_msg_boundary,
+                turn_start_mid=_turn_start_mid,
+                turn_had_shell=bool(_shell_tool_calls),
             )
         except Exception:
             logger.debug("_flush_file_changes failed", exc_info=True)
