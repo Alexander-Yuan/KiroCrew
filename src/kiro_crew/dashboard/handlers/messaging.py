@@ -17,6 +17,7 @@ import os
 import platform
 import re
 import time
+from collections.abc import Awaitable
 from pathlib import Path
 from typing import Any, Callable, cast  # noqa: F401
 
@@ -2188,7 +2189,7 @@ def _clean_id_list(raw: object, is_valid: Callable[[str], bool], label: str) -> 
     return out
 
 
-async def _write_env_off_loop(updates: dict[str, str | None], *, config_kept: bool = False) -> None:
+async def _write_env_off_loop(updates: dict[str, str | None]) -> None:
     """Run the blocking ``.env`` write on a worker, drained under the config lock.
 
     Every caller holds ``_get_config_lock()`` across this, and a thread cannot be
@@ -2211,13 +2212,10 @@ async def _write_env_off_loop(updates: dict[str, str | None], *, config_kept: bo
     A ``.env`` saved as UTF-16 or UTF-32 is refused before anything is written
     (:func:`_write_env_updates_locked` never overwrites a file it cannot
     parse). That refusal is raised here as a 409 carrying the fix, so every
-    channel save answers it the same way instead of with an opaque 500. A
-    caller that rolls its config write back on a failed ``.env`` write (Slack,
-    Teams, Webex, WeCom and Feishu) still does, because it catches every
-    exception; Discord and Telegram commit config before this call and keep it,
-    so their 409 leaves the config change in place and only the ``.env`` part
-    unsaved, which a retry after the UTF-8 re-save completes. Those two callers
-    pass ``config_kept=True`` so the 409 says their other settings were saved.
+    channel save answers it the same way instead of with an opaque 500. Every
+    saver (Slack, Teams, Webex, WeCom, Feishu, Discord and Telegram) reaches
+    this through :func:`_write_env_or_roll_back`, which rolls the config write
+    back on any failure, so on every channel the 409 means nothing was saved.
     """
     fut = asyncio.ensure_future(asyncio.to_thread(_write_env_updates, updates))
     try:
@@ -2226,23 +2224,57 @@ async def _write_env_off_loop(updates: dict[str, str | None], *, config_kept: bo
         await asyncio.wait([fut])
         raise
     except _loader.EnvFileWideEncodingError as exc:
-        raise _wide_env_refusal(exc, config_kept=config_kept) from exc
+        raise _wide_env_refusal(exc) from exc
 
 
-def _wide_env_refusal(
-    exc: _loader.EnvFileWideEncodingError, *, config_kept: bool = False
-) -> web.HTTPConflict:
-    """The response for a channel save refused because ``.env`` is wide-encoded.
+async def _write_env_or_roll_back(
+    env_updates: dict[str, str | None],
+    rollback: Callable[[], Awaitable[None]] | None,
+) -> None:
+    """Write a channel save's ``.env`` half, undoing its config half on failure.
 
-    ``config_kept`` is set by a caller whose config write stays in place when
-    the ``.env`` write is refused, so the message does not imply the whole save
-    was discarded.
+    Every channel saver commits ``config.json`` first and then calls this, so the
+    second half of the transaction exists once and a new saver cannot copy only
+    part of it. *rollback* undoes the config commit; pass ``None`` when the save
+    wrote no config.
+
+    A failed write runs *rollback* and re-raises, so a refused save (the wide
+    ``.env`` 409 included) changes nothing. A cancellation drains the write
+    first and runs *rollback* only when the write itself failed: a write that
+    landed before the cancel arrived already pairs with the committed config,
+    and rolling the config back would split the pair it means to keep. The
+    cancellation is re-raised either way.
+
+    On success the process environment is updated to match: ``load_credentials()``
+    lets ``os.environ`` win over ``.env``, so a replaced or cleared token would
+    otherwise keep reading as installed until restart, and spawned children
+    would inherit the stale value.
     """
-    outcome = "The .env was not changed"
-    outcome += "; your other settings were saved." if config_kept else "."
+    write = asyncio.ensure_future(_write_env_off_loop(env_updates))
+    try:
+        await asyncio.shield(write)
+    except asyncio.CancelledError:
+        await asyncio.gather(write, return_exceptions=True)
+        failed = not write.cancelled() and write.exception() is not None
+        if failed and rollback is not None:
+            await rollback()
+        raise
+    except BaseException:
+        if rollback is not None:
+            await rollback()
+        raise
+    for key, new_val in env_updates.items():
+        if new_val is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = new_val
+
+
+def _wide_env_refusal(exc: _loader.EnvFileWideEncodingError) -> web.HTTPConflict:
+    """The response for a channel save refused because ``.env`` is wide-encoded."""
     message = (
         f"{_loader.env_path()} is saved as {exc.wide_encoding}, which Kiro Crew "
-        f"cannot read. Re-save it as UTF-8 and save again. {outcome}"
+        "cannot read. Re-save it as UTF-8 and save again. The .env was not changed."
     )
     return web.HTTPConflict(
         text=json.dumps({"error": message}),
