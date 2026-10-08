@@ -3522,6 +3522,29 @@ surface, the seams and these placement rules.
 
 **Source precedence** (project-level wins): `$KIROCREW_PROJECT_DIR/skills/` → `builtin_skills/` (bundled). Auto-copied to `~/.kiro/crew/skills/` on first run. Copies entire skill directories (scripts, assets, etc.).
 
+**The Context-budget switch survives updates.** `inject_on_trigger: false` is the
+one user-mutable setting on a built-in skill, written into the installed
+`SKILL.md` by `set_inject_on_trigger`. A packaged `SKILL.md` never carries it, so
+`_ensure_builtin_skills` reads the opt-out off the destination before it claims the
+diverged tree for replacement, then applies it to the PACKAGED `SKILL.md` bytes
+through the same frontmatter rewrite the toggle uses
+(`skill_runtime.authoring.rewrite_inject_on_trigger`) and has `copytree` publish
+those bytes as the installed `SKILL.md`, with the packaged file's mode and
+timestamps. The installed file is written once and never read back and
+rewritten, so a dashboard save cannot be lost between a read and a write, and
+its mode matches the packaged file the fingerprint compares against. The provenance marker
+still records the PACKAGED tree's fingerprint, never one taken of the live
+destination, so a concurrent write cannot be blessed as sync-owned. The ownership
+and currency checks (`_verified_unchanged_fingerprint`, `_skill_currency_state`)
+tolerate exactly the carried line: when the straight comparison fails they
+fingerprint the tree again with that top-level `SKILL.md` line stripped, so a
+carried install is unchanged and in sync for `kirocrew doctor`, while any other
+edit still diverges. Without this carry an update turns full-body injection back
+on behind the user's back,
+the same reversion the auto-skill refine (`skill_runtime.auto_skills`)
+and update-approval (`skill_runtime.versions._rewrite_update_frontmatter`) paths
+already guard against on their own rewrites.
+
 **Retired generated skill cleanup.** `skills.remove_retired_conductor_skill()`
 removes `skills/conductor/SKILL.md` only when a descriptor-pinned, capped read has
 a CRLF-normalized SHA-256 matching one of the static generator outputs. Linked
