@@ -847,6 +847,10 @@ describe('McpTab disabled-in-config rows', () => {
       const title = badge?.getAttribute('title') ?? ''
       expect(title).toBe(`${label}: off (disabled in the shared MCP config; change it there)`)
       expect(badge?.getAttribute('aria-label')).toBe(title)
+      // #13076: the switch state and glyph agree with the "off" name even
+      // though the row's presence still reads on for this scope.
+      expect(badge).toHaveAttribute('aria-checked', 'false')
+      expect(badge?.querySelector('[data-testid="mcp-scope-switch-glyph"]')).toHaveAttribute('data-on', 'false')
       expect(title).not.toMatch(/pending uninstall/)
       names.push(title)
     }
@@ -990,5 +994,68 @@ describe('McpTab badge hints are keyboard/AT-reachable (#8359)', () => {
     const trigger = within(badge.parentElement!).getByRole('button', { name: 'More information' })
     fireEvent.click(trigger)
     expect((await screen.findByRole('tooltip')).textContent).toContain('3')
+  })
+})
+
+/**
+ * #13076: the Kiro Crew badge IS the per-server enable/disable for Kiro Crew
+ * sessions, but a coloured word did not read as a control. Every scope badge
+ * is now a switch: it says its state to assistive tech (role + aria-checked),
+ * shows it with a glyph rather than colour alone, and its hover text names
+ * the Apply step in the active language instead of hardcoded English.
+ */
+describe('McpTab scope badges are on/off switches (#13076)', () => {
+  const row = (name: string): HTMLElement => {
+    const tr = screen.getByText(name, { selector: 'code' }).closest('tr')
+    if (!tr) throw new Error(`no row for ${name}`)
+    return tr
+  }
+  const switchFor = (name: string, scope: string) =>
+    row(name).querySelector<HTMLButtonElement>(`button[data-scope="${scope}"]`)!
+
+  it('reports on/off state as a switch and stages a pending change on click', async () => {
+    mockApi.mcpServers.mockResolvedValue([server('alpha')])
+    renderTab()
+    await waitFor(() => expect(screen.getByText('alpha', { selector: 'code' })).toBeInTheDocument())
+    const kc = switchFor('alpha', 'kirocrew')
+    expect(kc).toHaveAttribute('role', 'switch')
+    expect(kc).toHaveAttribute('aria-checked', 'true')
+    expect(kc.getAttribute('title')).toBe('Kiro Crew: on (click to turn off, then Apply)')
+    expect(kc.querySelector('[data-testid="mcp-scope-switch-glyph"]')).toHaveAttribute('data-on', 'true')
+    expect(within(row('alpha')).getByRole('switch', { name: /^Kiro Crew: on/ })).toBe(kc)
+
+    fireEvent.click(kc)
+    await waitFor(() => expect(switchFor('alpha', 'kirocrew')).toHaveAttribute('aria-checked', 'false'))
+    const off = switchFor('alpha', 'kirocrew')
+    expect(off.getAttribute('title')).toBe('Kiro Crew: turns off when you press Apply (click to revert)')
+    expect(off.querySelector('[data-testid="mcp-scope-switch-glyph"]')).toHaveAttribute('data-on', 'false')
+    expect(screen.getByText(/1 pending change/)).toBeInTheDocument()
+  })
+
+  it('an off global scope reads as an unchecked switch', async () => {
+    mockApi.mcpServers.mockResolvedValue([server('alpha')])
+    renderTab()
+    await waitFor(() => expect(screen.getByText('alpha', { selector: 'code' })).toBeInTheDocument())
+    const kiro = switchFor('alpha', 'kiroGlobal')
+    expect(kiro).toHaveAttribute('aria-checked', 'false')
+    expect(kiro.getAttribute('title')).toBe('Kiro: off (click to turn on, then Apply)')
+  })
+
+  it('a disabled-in-config row staged for uninstall still reads off', async () => {
+    mockApi.mcpServers.mockResolvedValue([{
+      ...server('figma'), status: 'disabled', enabled: false, kirocrewManaged: false,
+      disabledIn: 'shared', disabledInFile: '~/.kiro/settings/mcp.json', tools: [],
+      presence: { kirocrew: true, kiroGlobal: true },
+    }])
+    renderTab()
+    await waitFor(() => expect(screen.getByText('figma', { selector: 'code' })).toBeInTheDocument())
+    fireEvent.click(within(row('figma')).getByRole('button', { name: 'Uninstall' }))
+    await waitFor(() => expect(screen.getByText(/1 pending change/)).toBeInTheDocument())
+    for (const scope of ['kirocrew', 'kiroGlobal']) {
+      const sw = switchFor('figma', scope)
+      expect(sw).toBeDisabled()
+      expect(sw).toHaveAttribute('aria-checked', 'false')
+      expect(sw.querySelector('[data-testid="mcp-scope-switch-glyph"]')).toHaveAttribute('data-on', 'false')
+    }
   })
 })
