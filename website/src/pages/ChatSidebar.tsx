@@ -2967,7 +2967,8 @@ function ChatSidebar({
   // Reduced motion disables every row. Otherwise renderSessionRow enrolls only
   // the first SIDEBAR_DISPLACEMENT_WINDOW paint positions in layout projection,
   // bounding Framer's measurement set without a total-list-size cliff.
-  const rowAnimEnabled = !reduceMotion
+  // `rowAnimEnabled` itself is derived below the pinned-header hold, which
+  // also turns it off (see `instantCloseId`).
 
   const {
     isFolderFilteredOut, revealedContainers, toggleReveal, hiddenByContainer, allHiddenFolders,
@@ -3024,7 +3025,10 @@ function ChatSidebar({
   // moves the lane to keep a pinned header where it is painted, in the commit
   // that hides the body (see stickyCollapse.ts); `from` is the pressed control,
   // inside the folder block.
-  const { armHold, disarm: disarmHold } = useHoldPinnedHeaderOnCollapse(laneScrollRef, folders)
+  const { armHold, disarm: disarmHold, instantCloseId } = useHoldPinnedHeaderOnCollapse(laneScrollRef, folders)
+  // A collapse from a pinned header takes the reduced-motion path for its one
+  // commit (`instantCloseId`, see stickyCollapse.ts).
+  const rowAnimEnabled = !reduceMotion && instantCloseId === null
   const toggleListFolderCollapse = (folder: ChatFolder, from: HTMLElement) => {
     if (folder.collapsed) disarmHold()
     else armHold(folder.id, from.closest<HTMLElement>('[data-folder-drop]'))
@@ -4163,7 +4167,7 @@ function ChatSidebar({
           <div ref={setNodeRef} data-folder-drop={folder.id} style={{ '--folder-pin-stack': `calc(var(--folder-row-sticky-h) * ${depth + 1})` } as React.CSSProperties} className={`rounded-md transition-all mb-0.5${isOver ? ' ring-1 ring-accent' : ''}`}>
             {renderFolderHeader(folder, dragHandleProps, emptyBody, depth)}
             {renderFolderCreateError(folder.id)}
-            {wrapped && <FolderBody key={`folder-body-${folder.id}`} padding={FOLDER_BODY_OPEN_PADDING} open={!folder.collapsed && !forceCollapsed}>{wrapped}</FolderBody>}
+            {wrapped && <FolderBody key={`folder-body-${folder.id}`} padding={FOLDER_BODY_OPEN_PADDING} open={!folder.collapsed && !forceCollapsed} instantClose={instantCloseId === folder.id}>{wrapped}</FolderBody>}
           </div>
         )}
       </DndDroppable>,
