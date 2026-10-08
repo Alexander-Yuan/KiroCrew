@@ -25,7 +25,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, Callable, NamedTuple, Optional
 
-from kiro_crew import platform_compat
+from kiro_crew import github_runner, platform_compat
 from kiro_crew.cloud import aws
 from kiro_crew.config.loader import config_dir
 from kiro_crew.sel import sel
@@ -221,8 +221,8 @@ def _group_shared_with_another_account(gid: int) -> Optional[str]:
     with the same gid, and each grants its members that gid as a supplementary
     group. So the supplementary half reads every entry carrying the gid.
     """
-    # Local import: neither module exists on Windows, where the walk has already
-    # stood down before reaching here.
+    # Local import: neither module exists on Windows, which never reaches here --
+    # only the POSIX arm of the walk calls this; the Windows arm reads the ACL.
     import grp
     import pwd
 
@@ -303,6 +303,97 @@ def _acl_admits_another_account(node: Path, mine: int) -> Optional[str]:
     return None
 
 
+def _first_replaceable_windows(path: Path) -> Optional[tuple[Path, str]]:
+    """The Windows arm of :func:`_first_replaceable`, read from the ACL.
+
+    The same two questions the POSIX walk asks -- is an ancestor owned by a third
+    account, and can anything outside the trusted set replace what is inside it --
+    answered from each directory's SECURITY DESCRIPTOR because ``st_uid`` and the
+    mode bits carry no information on Windows (``os.stat`` reports ``st_uid == 0``
+    and ``st_mode == 0o777`` for every path).
+
+    The per-component decision is NOT re-implemented here: it is exactly the
+    relaxed-mode policy :func:`kiro_crew.github_runner.check_provider_path_component_windows`
+    already applies to each parent of a provider CLI -- owner and writers must be
+    the launcher, a well-known machine SID, or (here) Owner Rights -- reading the
+    descriptor through :func:`kiro_crew.windows_acl.describe`. Calling it keeps ONE
+    spelling of the policy, so the two walks cannot drift apart. This arm supplies
+    only what differs from that walk: the chain to visit, the first-failing-node
+    return shape (the function raises per component; this maps the raise to
+    ``(node, reason)``), and the one extra trusted principal below.
+
+    Without this ancestor walk, the only Windows protections on the staging path
+    are the link/junction screens and the inheritable owner-only DACL on the
+    staging leaf, and neither sees an ANCESTOR of the leaf renamed away and
+    replaced with a real directory. On a multi-user host whose data home sits
+    under a directory a local peer can write, that swap reaches the uploaded
+    tarball. The walk closes it.
+
+    ``S-1-3-4`` (Owner Rights) is trusted here where the provider-executable walk
+    does not trust it: this chain runs over the data home, and
+    ``ensure_data_home`` locks that home down with an inheritable owner-only DACL
+    whose grants are ``(S-1-3-4, me)`` -- so the Owner-Rights full-control ACE on
+    this chain is this account's OWN lockdown, not a foreign writer, and refusing
+    on it would reject the ordinary locked-down home on every launch.
+
+    Fails closed on an unverifiable launcher SID -- ``current_user_sid`` reads only
+    this process's access token and returns ``None`` on failure, so there is
+    nothing to compare an owner or writer against. The POSIX arm cannot reach that
+    (``geteuid`` always answers); the shared function needs a non-empty ``me_sid``,
+    so the guard also protects the call. Every other failure shape -- unreadable
+    descriptor, non-local volume, NULL DACL, unparsable ACE, foreign owner, foreign
+    writer -- is the shared function's and surfaces as its ``ValueError`` message;
+    any exception it does NOT raise as a ``ValueError`` (an ``OSError`` from the
+    volume probe, say) is still an uncleared descriptor and is caught and returned
+    as a fail-closed ``(node, reason)`` rather than propagated.
+
+    The volume ROOT is passed ``volume_root=True``: a drive root is not an entry
+    in any directory on this host, so a plain ``DELETE`` grant on it swaps nothing
+    and is not treated as a replaceability vector there, while
+    ``FILE_DELETE_CHILD`` (the actual child-swap right on a root) and the other
+    substitution rights still refuse. The stock ACL on a secondary NTFS volume
+    grants ``Authenticated Users`` Modify -- which carries ``DELETE`` but not
+    ``FILE_DELETE_CHILD`` -- on the drive root, and without this exemption a data
+    home relocated directly under such a root was refused although it is safe.
+
+    Only ancestors :func:`_chain_the_launcher_owns` returns are in scope, same as
+    POSIX: a directory above the operator's home belongs to the administrator, and a
+    relocated home is walked whole.
+    """
+    me_sid = platform_compat.current_user_sid()
+    if not me_sid:
+        return path, "runs under a user whose SID this host cannot verify"
+    for node in _chain_the_launcher_owns(path):
+        try:
+            github_runner.check_provider_path_component_windows(
+                node,
+                label=f"'{node}'",
+                me_sid=me_sid,
+                strict=False,
+                trust_owner_rights=True,
+                # A volume root cannot itself be renamed or deleted, so a plain
+                # DELETE grant on it is no swap vector -- let the shared check
+                # ignore a DELETE-only writer there while still refusing
+                # FILE_DELETE_CHILD / WRITE_DAC / WRITE_OWNER / GENERIC_ALL.
+                volume_root=node == Path(node.anchor),
+            )
+        except ValueError as exc:
+            # The function raises the first problem it finds on this node, label
+            # first; strip the label so the caller's sentence reads "'<node>'
+            # <reason>, so what it holds can be replaced...".
+            reason = str(exc)
+            prefix = f"'{node}' "
+            return node, reason[len(prefix) :] if reason.startswith(prefix) else reason
+        except Exception as exc:
+            # The shared check surfaces every policy failure as a ValueError; any
+            # OTHER exception (e.g. an OSError from the volume probe inside
+            # describe()) is still a descriptor we could not clear. Fail closed on
+            # the node with a readable reason rather than letting a raw exception
+            # propagate out of the launch prologue.
+            return node, f"could not be checked ({type(exc).__name__}: {exc})"
+    return None
+
+
 def _first_replaceable(path: Path) -> Optional[tuple[Path, str]]:
     """The outermost directory the launcher owns that another account could replace into.
 
@@ -339,11 +430,12 @@ def _first_replaceable(path: Path) -> Optional[tuple[Path, str]]:
     :func:`_acl_admits_another_account` asks the named entries the same question.
 
     Root-first, so the answer is the outermost problem rather than an inner symptom
-    of it. Windows mode bits and uids carry no ACL information, so the walk stands
-    down there and the ACL the lockdown applies is the guarantee instead.
+    of it. On Windows ``st_uid`` and the mode bits carry no information, so the walk
+    reads each ancestor's SECURITY DESCRIPTOR instead and asks the same two
+    questions from it -- see :func:`_first_replaceable_windows`.
     """
     if platform_compat.IS_WINDOWS:
-        return None
+        return _first_replaceable_windows(path)
     mine = os.geteuid()
     for node in _chain_the_launcher_owns(path):
         try:
@@ -472,12 +564,31 @@ def _staging_dir() -> Path:
         node, reason = replaceable
         # The path IS named: it is the operator's own layout, they chose it through
         # the data-home setting, and the path is what makes the message actionable.
+        # The remedy is platform-specific: chmod/setfacl do not exist on Windows and
+        # cannot change a DACL, so a Windows refusal would otherwise point the
+        # operator at commands they cannot run.
+        if platform_compat.IS_WINDOWS:
+            # On these chains the offending grant is usually INHERITED from a
+            # parent, and 'icacls /remove:g' does not remove an inherited ACE --
+            # inheritance has to be converted to explicit ACEs first
+            # ('/inheritance:d'). Moving the data home under a directory only you
+            # can write avoids the ACL edit entirely.
+            remedy = (
+                f"Convert the directory's inherited ACL to explicit entries and remove "
+                f"the foreign grant (e.g. 'icacls \"{node}\" /inheritance:d' then "
+                f"'icacls \"{node}\" /remove:g <account>'), or move the data home "
+                "under a directory only you can write."
+            )
+        else:
+            remedy = (
+                f"Drop the write bit ('chmod go-w {node}'), remove the ACL "
+                f"('setfacl -b {node}'), or move the data home under a directory "
+                "only you can write."
+            )
         raise aws.AWSError(
             f"'{node}' {reason}, so what it holds can be replaced wholesale and the AWS CLI "
-            "would re-open the staged name inside the replacement -- refusing to build the "
-            f"source tarball. Drop the write bit ('chmod go-w {node}'), remove the ACL "
-            f"('setfacl -b {node}'), or move the data home under a directory only you can "
-            "write.",
+            f"would re-open the staged name inside the replacement -- refusing to build the "
+            f"source tarball. {remedy}",
             action="source:PackageLocalCheckout",
         )
     staging = base / _STAGING_DIR_LEAF
