@@ -51,6 +51,7 @@ from kiro_crew.artifacts import (
     USER_SELECTABLE_KINDS,
     ArtifactAlreadyExistsError,
     ArtifactComment,
+    ArtifactConflictError,
     ArtifactError,
     ArtifactNotFoundError,
     ArtifactReplacedError,
@@ -1607,7 +1608,7 @@ async def api_artifact_detail(request: web.Request) -> web.Response:
     slug = request.match_info.get("slug", "")
     try:
         store = get_default_store()
-        art = store.get(slug)
+        art = await _run_off_loop(lambda: store.get(slug, assign_token=True))
     except ArtifactNotFoundError as exc:
         return _err(str(exc), status=404)
     except ArtifactValidationError as exc:
@@ -1824,6 +1825,7 @@ async def api_artifact_update(request: web.Request) -> web.Response:
                 event_type=event_type,
                 from_version=from_version,
                 snapshot=snapshot,
+                expected_token=body.get("expected_token"),
             )
         )
         # store.update() only loads content into the returned Artifact when
@@ -1851,6 +1853,24 @@ async def api_artifact_update(request: web.Request) -> web.Response:
             error=str(exc),
         )
         return _err(str(exc))
+    except ArtifactConflictError as exc:
+        # A stale content write: nothing was written. The body carries what the
+        # client needs to refetch and re-base.
+        _audit(
+            tool="artifact_update",
+            request=request,
+            outcome="denied",
+            error=str(exc),
+            extra={"slug": slug},
+        )
+        return web.json_response(
+            {
+                "error": str(exc),
+                "code": "artifact_conflict",
+                "current_token": exc.current_token,
+            },
+            status=409,
+        )
     except ArtifactError as exc:
         # Catches the base class fallback — store._write_text() raises
         # ArtifactError("refusing to write sensitive path: ...") which is
@@ -2053,7 +2073,7 @@ async def api_artifact_delete(request: web.Request) -> web.Response:
     # Capture the pre-delete version so the deleted-variant WS event carries the
     # last-known version.
     try:
-        _existing = get_default_store().get(slug)
+        _existing = await _run_off_loop(lambda: get_default_store().get(slug))
     except ArtifactError:
         # Best-effort version capture only — swallow both the missing-slug and
         # invalid-slug (ArtifactValidationError) siblings so an invalid slug still
@@ -2357,7 +2377,7 @@ async def api_artifact_events(request: web.Request) -> web.Response:
     """
     slug = request.match_info.get("slug", "")
     try:
-        art = get_default_store().get(slug)
+        art = await _run_off_loop(lambda: get_default_store().get(slug))
     except ArtifactNotFoundError as exc:
         return _err(str(exc), status=404)
     except ArtifactValidationError as exc:
