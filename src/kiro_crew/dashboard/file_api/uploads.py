@@ -36,6 +36,7 @@ if TYPE_CHECKING:
         SNIFF_BYTES,
         _sel,
         data_home,
+        ensure_directory,
         logger,
         part_stream,
         sniff_raster_mime,
@@ -186,7 +187,7 @@ async def api_upload_file(request: web.Request) -> web.Response:
     """
 
     upload_dir = _upload_dir()
-    upload_dir.mkdir(parents=True, exist_ok=True)
+    ensure_directory(upload_dir)  # 0700 in the data home: uploads are user files
     reader = await request.multipart()
     paths: list[str] = []
     allowed = (
