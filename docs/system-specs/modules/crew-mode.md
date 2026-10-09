@@ -1018,8 +1018,8 @@ Glass chip is a door, since the switcher chip beside it is another Glass chip
 with faces in it. The pill is a toggle, as its `aria-expanded` says: with Profile
 already open a press CLOSES it through the same schedule-draft guard as the
 card's own close control (`requestCloseProfile`). It must not re-open on the
-Profile tab: `profile.tab` is part of the card's React key, so a card opened on
-another tab (the quiet-chat Sessions link) would be remounted and a New schedule
+default tab: `profile.tab` is part of the card's React key, so a card the reader
+moved to another tab (Schedules, say) would be remounted and a New schedule
 draft inside it destroyed with no question asked. Pointer users rarely reach the
 pill under the floating card's scrim; keyboard users reach it every time. The
 pill's title row is the display name plus the exact ID in mono when a label
@@ -1030,9 +1030,24 @@ the chat
 SidePanel is closed on a non-phone viewport, Profile takes a 34%-of-row in-flow
 column and narrows the thread. On phones it always floats over the thread: the
 composed column is wider than a 320px viewport and must never be added there. The
-pill unmounts in the non-phone column state and its `CrewStateAvatar` shares a Framer
-Motion `layoutId` with the card's head avatar: one face moves from the pill to the
-card rather than two faces cross-fading. Opening SidePanel collapses that Profile
+pill unmounts in the non-phone column state and its face flies to the card's head:
+one face moves rather than two faces cross-fading. The flight is `CrewFaceFlight`, a
+copy of the face portaled to `document.body` (`fixed`, `z-[60]`, `pointer-events-none`,
+`data-testid="crew-face-flight"`) tweened on framer's own default layout
+clock (`FACE_FLIGHT_SECS`, the `defaultLayoutTransition` the `layoutId` flight ran on) from the departing face's box to the landing face's box, which is
+re-read every frame because the landing face moves while the column reveals or folds;
+both real faces hold their place with `visibility: hidden` until it lands, and reduced
+motion or a face with no box (jsdom) is a plain swap. It is NOT a framer `layoutId`
+shared by the two faces (#18236): a shared element travels inside whichever surface
+owns it, so the card's face was clipped by the card's rounded `overflow-hidden`
+shell, its scrolling body and the width-revealing aside until it was already inside
+them, and the pill's face was painted under the thread and the folding card, both
+later siblings of the header. The docked column's `AnimatePresence` keeps one slot
+in both placements, so closing it runs its width exit and the leaving card's face
+stays measurable as the flight's origin; the presence is keyed on the card's
+placement, so a column RE-PLACED as the floating card (the window crossed below
+`md`) is dropped at once with no exit and no flight — a phone-width viewport never
+holds the column beside the floating card. Opening SidePanel collapses that Profile
 column and restores the pill. If SidePanel is already open, or the viewport is a
 phone, the pill opens Profile as a full-height, rounded hover card centred
 horizontally in the chat width the open SidePanel leaves; both surfaces remain
@@ -1069,7 +1084,10 @@ name + requested tab + accepted-open nonce).
 
 Profile uses the shared `Tablist` component with `labels="active"`: all four tabs
 carry Lucide icons and accessible labels, while only the selected tab paints its
-word. The tabs are **Profile**, **Schedules**, **Sessions**, and **Goals**. No
+word. The tabs are, in strip order, **Sessions**, **Schedules**, **Goals**, and
+**Profile** (the work first, the identity card last). The card opens on Sessions
+unless the opener names a tab (`openProfile(tab)`; today only the quiet-chat link
+calls it, and it asks for Sessions too). No
 tab carries a count, and there is no placeholder tab for a view that does not
 exist yet.
 
